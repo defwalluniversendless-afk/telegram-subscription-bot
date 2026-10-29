@@ -1,10 +1,11 @@
-"""Telegram-бот: платная подписка на закрытый канал (ЮKassa, СБП/карты).
+"""Telegram-бот: платная подписка на закрытый канал с лекциями (ЮKassa).
 
-Работает так:
-  оплата -> доступ (одноразовая ссылка-приглашение) -> напоминания -> (автосписание) -> закрытие доступа.
-Оплаты подтверждаются двумя способами сразу: вебхуком ЮKassa (если настроен) и опросом статуса каждую минуту.
+Воронка: /start или /join -> кнопка -> карточка товара + оферта -> оплата -> доступ в канал
+-> напоминания -> (автосписание) -> закрытие доступа. /help — связь с владельцем.
+Все тексты бота лежат в блоке TEXTS ниже: правьте формулировки там.
 """
 import asyncio
+import html
 import logging
 import os
 import sqlite3
@@ -13,28 +14,63 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiohttp import web
 from dotenv import load_dotenv
 from yookassa import Configuration, Payment
 
 load_dotenv()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL_ID = int(os.environ["CHANNEL_ID"])      # вида -1001234567890
-ADMIN_ID = int(os.environ["ADMIN_ID"])          # ваш Telegram ID
-PRICE = float(os.getenv("PRICE", "990"))        # цена за период, руб
+CHANNEL_ID = int(os.environ["CHANNEL_ID"])        # вида -1001234567890
+ADMIN_ID = int(os.environ["ADMIN_ID"])            # ваш Telegram ID
+PRICE = float(os.getenv("PRICE", "2500"))         # цена за период, руб
 PERIOD_DAYS = float(os.getenv("PERIOD_DAYS", "30"))
-REMIND_DAYS = float(os.getenv("REMIND_DAYS", "3"))
-TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = «оплата» без ЮKassa, для проверки бота
+REMIND_DAYS = float(os.getenv("REMIND_DAYS", "3"))    # за сколько дней напоминать о продлении
+STUCK_HOURS = float(os.getenv("STUCK_HOURS", "24"))   # через сколько часов напомнить «застрявшему» на оплате
+OFFER_URL = os.getenv("OFFER_URL", "")            # ссылка на публичную оферту
 AUTOCHARGE = os.getenv("AUTOCHARGE", "0") == "1"  # автосписание (нужно включить у ЮKassa)
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "0"))  # 0 = вебхук выключен, только опрос
+TEST_MODE = os.getenv("TEST_MODE", "0") == "1"    # 1 = ЮKassa не подключена: «оплатить» может только админ
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "0"))    # 0 = вебхук выключен, только опрос
 RETURN_URL = os.getenv("RETURN_URL", "https://t.me/")
 if not TEST_MODE:
     Configuration.configure(os.environ["YOOKASSA_SHOP_ID"], os.environ["YOOKASSA_SECRET"])
 
+# ============================== TEXTS ==============================
+# Разметка: <b>жирный</b>, <i>курсив</i>. Подстановки в {фигурных скобках} не трогайте.
+T_WELCOME = ("Привет, я бот Круга Ильи Хабирова. Я выдаю доступ к закрытому каналу с лекциями.\n"
+             "Оплатить можно картой.\n\nЧтобы оплатить, нажмите на кнопку 👇")
+T_PRODUCT = ("📚 <b>Ежемесячная подписка на закрытый канал с лекциями</b>\n"
+             "Цена: <b>{price} ₽</b> в месяц\n\n"
+             "Перед оплатой ознакомьтесь с {offer}.")
+T_AUTO_NOTE = "\n\nОплачивая, вы соглашаетесь на ежемесячное автопродление. Отключить: /cancel"
+T_OFFER_LINK = '<a href="{url}">публичной офертой</a>'
+T_OFFER_SOON = "публичной офертой (ссылка скоро появится)"
+T_PAY_LINK = "Ссылка на оплату готова. После оплаты доступ придёт сюда автоматически."
+T_NOT_READY = "Приём оплаты ещё настраивается, скоро всё заработает. Если вопрос срочный, нажмите «Связаться»."
+T_ACTIVE = "У вас уже есть доступ к каналу до {date}. Продлить подписку можно кнопкой ниже."
+T_STATUS_NO = "Подписки нет. Чтобы получить доступ, нажмите кнопку."
+T_PAID_NEW = ("✅ Оплата получена. Подписка до {date}.\n\n"
+              "Ваша ссылка в канал (одноразовая, действует сутки):\n{link}")
+T_PAID_EXT = "✅ Подписка продлена до {date}."
+T_PAID_NOLINK = "✅ Оплата получена, но ссылку выдать не удалось. Нажмите /help, и мы всё решим."
+T_REMIND = "🔔 Подписка заканчивается {end}. Чтобы не потерять доступ, продлите её:"
+T_REMIND_AUTO = "🔔 Подписка до {end}. Спишем {price} ₽ автоматически. Отключить автопродление: /cancel"
+T_AUTO_FAIL = "Не удалось списать оплату автоматически. Продлите вручную:"
+T_EXPIRED = "⏰ Подписка закончилась, доступ к каналу закрыт. Продлить:"
+T_STUCK = ("Вижу, вы застопорились на моменте оплаты. Что-то не так?\n"
+           "Если не получается оплатить или остались вопросы, нажмите «Связаться», и мы поможем.")
+T_HELP_PROMPT = ("Опишите проблему или вопрос одним сообщением (можно приложить скриншот). "
+                 "Я передам его Илье, и ответ придёт сюда.")
+T_HELP_SENT = "Передал. Ответим вам здесь, как только сможем."
+T_UNKNOWN = "Не понял сообщение. Нажмите /start, чтобы начать, или /help, чтобы связаться с нами."
+T_CANCEL = "Автопродление отключено. Доступ сохранится до конца оплаченного срока."
+# ===================================================================
+
 logging.basicConfig(level=logging.INFO)
-bot = Bot(BOT_TOKEN)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
 dp = Dispatcher()
 
 db = sqlite3.connect("bot.db")
@@ -42,10 +78,19 @@ db.row_factory = sqlite3.Row
 db.executescript("""
 CREATE TABLE IF NOT EXISTS users(
   user_id INTEGER PRIMARY KEY, username TEXT, expires_at TEXT, method_id TEXT,
-  autopay INTEGER DEFAULT 1, last_remind TEXT, last_charge TEXT, active INTEGER DEFAULT 0);
+  autopay INTEGER DEFAULT 1, last_remind TEXT, last_charge TEXT, active INTEGER DEFAULT 0,
+  pay_started_at TEXT, stuck_reminded INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT);
 CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT);
+CREATE TABLE IF NOT EXISTS help(msg_id INTEGER PRIMARY KEY, user_id INTEGER);
 """)
+_cols = {r["name"] for r in db.execute("PRAGMA table_info(users)")}  # миграция старой базы
+for _name, _ddl in (("pay_started_at", "TEXT"), ("stuck_reminded", "INTEGER DEFAULT 0")):
+    if _name not in _cols:
+        db.execute(f"ALTER TABLE users ADD COLUMN {_name} {_ddl}")
+db.commit()
+
+awaiting_help: set[int] = set()  # кто сейчас пишет вопрос администратору
 
 
 def now() -> datetime:
@@ -60,9 +105,25 @@ def fmt(d: datetime) -> str:
     return d.strftime("%d.%m.%Y")
 
 
-def pay_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"💳 Оплатить {PRICE:.0f} ₽", callback_data="pay")]])
+def btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def markup(*rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows])
+
+
+KB_START = markup([btn("💳 Оплатить", "buy")])
+KB_RENEW = markup([btn("💳 Продлить подписку", "buy")])
+KB_PAY = lambda: markup([btn(f"💳 Оплатить {PRICE:.0f} ₽", "pay")], [btn("🆘 Связаться", "help")])
+KB_STUCK = markup([btn("🆘 Связаться", "help")], [btn("💳 Оплатить", "buy")])
+KB_HELP = markup([btn("🆘 Связаться", "help")])
+
+
+def ensure_user(uid: int, username: str | None):
+    db.execute("INSERT INTO users(user_id, username) VALUES(?,?) "
+               "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username", (uid, username))
+    db.commit()
 
 
 async def safe_send(uid: int, text: str, kb=None):
@@ -77,12 +138,12 @@ def _create_payment(user_id: int, method_id: str | None = None):
     params = {
         "amount": {"value": f"{PRICE:.2f}", "currency": "RUB"},
         "capture": True,
-        "description": f"Доступ к закрытому каналу, {PERIOD_DAYS:g} дн.",
+        "description": "Ежемесячная подписка на закрытый канал с лекциями",
         "metadata": {"user_id": str(user_id)},
     }
     if method_id:  # автосписание с сохранённого способа оплаты
         params["payment_method_id"] = method_id
-    else:
+    else:  # ← ЗДЕСЬ создаётся платёж; когда ЮKassa подключат, добавим чек/доп. параметры
         params["confirmation"] = {"type": "redirect", "return_url": RETURN_URL}
         params["save_payment_method"] = AUTOCHARGE
     return Payment.create(params, str(uuid.uuid4()))
@@ -109,7 +170,7 @@ async def handle_payment(p):
     await extend(uid, PERIOD_DAYS, method)
 
 
-async def extend(uid: int, days: int, method_id: str | None = None):
+async def extend(uid: int, days: float, method_id: str | None = None):
     row = db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
     base, was_active = now(), False
     if row and row["expires_at"] and row["active"]:
@@ -119,20 +180,20 @@ async def extend(uid: int, days: int, method_id: str | None = None):
     new_exp = base + timedelta(days=days)
     db.execute("""INSERT INTO users(user_id, expires_at, active, method_id) VALUES(?,?,1,?)
                   ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at, active=1,
-                  method_id=COALESCE(excluded.method_id, method_id)""", (uid, iso(new_exp), method_id))
+                  method_id=COALESCE(excluded.method_id, method_id),
+                  pay_started_at=NULL, stuck_reminded=0""", (uid, iso(new_exp), method_id))
     db.commit()
     if was_active:
-        await safe_send(uid, f"✅ Подписка продлена до {fmt(new_exp)}.")
+        await safe_send(uid, T_PAID_EXT.format(date=fmt(new_exp)))
         return
     try:
         link = await bot.create_chat_invite_link(
             CHANNEL_ID, member_limit=1, expire_date=int(time.time()) + 86400)
-        await safe_send(uid, f"✅ Оплата получена. Подписка до {fmt(new_exp)}.\n\n"
-                             f"Ваша ссылка в канал (одноразовая, действует сутки):\n{link.invite_link}")
+        await safe_send(uid, T_PAID_NEW.format(date=fmt(new_exp), link=link.invite_link))
     except Exception:
         logging.exception("не удалось создать ссылку")
-        await safe_send(uid, "✅ Оплата получена, но ссылку выдать не удалось. Напишите администратору.")
-        await safe_send(ADMIN_ID, f"⚠️ Не удалось выдать ссылку пользователю {uid}. Бот — админ канала?")
+        await safe_send(uid, T_PAID_NOLINK, KB_HELP)
+        await safe_send(ADMIN_ID, f"⚠️ Не удалось выдать ссылку пользователю <code>{uid}</code>. Бот — админ канала?")
 
 
 async def expire(uid: int):
@@ -143,49 +204,92 @@ async def expire(uid: int):
         logging.exception("не удалось удалить %s из канала", uid)
     db.execute("UPDATE users SET active=0 WHERE user_id=?", (uid,))
     db.commit()
-    await safe_send(uid, "⏰ Подписка закончилась, доступ к каналу закрыт. Продлить:", pay_kb())
+    await safe_send(uid, T_EXPIRED, KB_RENEW)
 
 
-# ---------- Команды ----------
-@dp.message(CommandStart())
+# ---------- Воронка: /start -> оплата ----------
+@dp.message(Command("start", "join"))
 async def start(m: Message):
-    db.execute("INSERT INTO users(user_id, username) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username",
-               (m.from_user.id, m.from_user.username))
+    ensure_user(m.from_user.id, m.from_user.username)
+    u = db.execute("SELECT * FROM users WHERE user_id=?", (m.from_user.id,)).fetchone()
+    if u["active"] and u["expires_at"]:
+        await m.answer(T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))), reply_markup=KB_RENEW)
+        return
+    await m.answer(T_WELCOME, reply_markup=KB_START)
+
+
+@dp.callback_query(F.data == "buy")
+async def buy(cb: CallbackQuery):
+    uid = cb.from_user.id
+    ensure_user(uid, cb.from_user.username)
+    # человек дошёл до оплаты: запускаем таймер «застрял на оплате»
+    db.execute("UPDATE users SET pay_started_at=?, stuck_reminded=0 WHERE user_id=? AND active=0", (iso(now()), uid))
     db.commit()
-    auto = "\nПодписка продлевается автоматически, отключить: /cancel." if AUTOCHARGE else \
-           "\nЗа несколько дней до конца я напомню о продлении."
-    await m.answer(f"Привет! Доступ к закрытому каналу с лекциями: {PRICE:.0f} ₽ за {PERIOD_DAYS:g} дн.{auto}\n"
-                   f"Статус: /status", reply_markup=pay_kb())
+    offer = T_OFFER_LINK.format(url=html.escape(OFFER_URL, quote=True)) if OFFER_URL else T_OFFER_SOON
+    text = T_PRODUCT.format(price=f"{PRICE:.0f}", offer=offer) + (T_AUTO_NOTE if AUTOCHARGE else "")
+    await cb.message.answer(text, reply_markup=KB_PAY())
+    await cb.answer()
 
 
+@dp.callback_query(F.data == "pay")
+async def pay(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await cb.answer()
+    if TEST_MODE:  # ЮKassa ещё не подключена: «оплатить» работает только у админа (для проверки)
+        if uid == ADMIN_ID:
+            await extend(uid, PERIOD_DAYS)
+        else:
+            await cb.message.answer(T_NOT_READY, reply_markup=KB_HELP)
+        return
+    p = await new_payment(uid)
+    kb = markup([InlineKeyboardButton(text="Перейти к оплате", url=p.confirmation.confirmation_url)],
+                [btn("🆘 Связаться", "help")])
+    await cb.message.answer(T_PAY_LINK, reply_markup=kb)
+
+
+# ---------- Связь с владельцем ----------
+@dp.message(Command("help"))
+async def help_cmd(m: Message):
+    awaiting_help.add(m.from_user.id)
+    await m.answer(T_HELP_PROMPT)
+
+
+@dp.callback_query(F.data == "help")
+async def help_btn(cb: CallbackQuery):
+    awaiting_help.add(cb.from_user.id)
+    await cb.message.answer(T_HELP_PROMPT)
+    await cb.answer()
+
+
+@dp.message(F.from_user.id == ADMIN_ID, F.reply_to_message)
+async def admin_reply(m: Message):
+    """Ответ админа реплаем на пересланный вопрос уходит автору вопроса."""
+    row = db.execute("SELECT user_id FROM help WHERE msg_id=?", (m.reply_to_message.message_id,)).fetchone()
+    if not row:
+        await m.answer("Не нашёл, кому отвечать. Отвечайте реплаем именно на сообщение с вопросом.")
+        return
+    try:
+        await m.copy_to(row["user_id"])
+        await m.answer("✅ Отправлено.")
+    except Exception:
+        await m.answer("Не удалось отправить: пользователь мог заблокировать бота.")
+
+
+# ---------- Остальные команды ----------
 @dp.message(Command("status"))
 async def status(m: Message):
     u = db.execute("SELECT * FROM users WHERE user_id=?", (m.from_user.id,)).fetchone()
     if u and u["active"] and u["expires_at"]:
-        await m.answer(f"Подписка активна до {fmt(datetime.fromisoformat(u['expires_at']))}.")
+        await m.answer(f"Подписка активна до {fmt(datetime.fromisoformat(u['expires_at']))}.", reply_markup=KB_RENEW)
     else:
-        await m.answer("Подписки нет.", reply_markup=pay_kb())
+        await m.answer(T_STATUS_NO, reply_markup=KB_START)
 
 
 @dp.message(Command("cancel"))
 async def cancel(m: Message):
     db.execute("UPDATE users SET autopay=0 WHERE user_id=?", (m.from_user.id,))
     db.commit()
-    await m.answer("Автопродление отключено. Доступ сохранится до конца оплаченного срока.")
-
-
-@dp.callback_query(F.data == "pay")
-async def pay(cb: CallbackQuery):
-    if TEST_MODE:  # тест: считаем, что оплата прошла
-        await cb.answer()
-        await extend(cb.from_user.id, PERIOD_DAYS)
-        return
-    p = await new_payment(cb.from_user.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Перейти к оплате (СБП / карта)", url=p.confirmation.confirmation_url)]])
-    note = "\nОплачивая, вы соглашаетесь на ежемесячное автопродление (отключить: /cancel)." if AUTOCHARGE else ""
-    await cb.message.answer(f"Ссылка на оплату. После оплаты доступ придёт сюда автоматически.{note}", reply_markup=kb)
-    await cb.answer()
+    await m.answer(T_CANCEL)
 
 
 @dp.message(Command("grant"))
@@ -206,7 +310,25 @@ async def stats(m: Message):
         return
     n = db.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0]
     s = db.execute("SELECT COUNT(*) FROM payments").fetchone()[0]
-    await m.answer(f"Активных подписчиков: {n}\nВсего оплат: {s}")
+    stuck = db.execute("SELECT COUNT(*) FROM users WHERE active=0 AND pay_started_at IS NOT NULL").fetchone()[0]
+    await m.answer(f"Активных подписчиков: {n}\nВсего оплат: {s}\nДошли до оплаты, но не оплатили: {stuck}")
+
+
+@dp.message()
+async def any_message(m: Message):
+    """Всё остальное: либо вопрос администратору (после /help), либо подсказка."""
+    uid = m.from_user.id
+    if uid in awaiting_help and uid != ADMIN_ID:
+        awaiting_help.discard(uid)
+        who = html.escape(m.from_user.full_name) + (f" (@{m.from_user.username})" if m.from_user.username else "")
+        head = await bot.send_message(
+            ADMIN_ID, f"🆘 Вопрос от {who}, id <code>{uid}</code>.\nОтветьте реплаем на это сообщение или на следующее.")
+        copy = await m.copy_to(ADMIN_ID)
+        db.executemany("INSERT OR REPLACE INTO help VALUES(?,?)", [(head.message_id, uid), (copy.message_id, uid)])
+        db.commit()
+        await m.answer(T_HELP_SENT)
+    else:
+        await m.answer(T_UNKNOWN, reply_markup=KB_HELP)
 
 
 # ---------- Фоновая проверка ----------
@@ -221,6 +343,16 @@ async def check_pending():
         elif p.status == "canceled" or datetime.fromisoformat(r["created"]) < now() - timedelta(days=2):
             db.execute("DELETE FROM pending WHERE id=?", (r["id"],))
             db.commit()
+
+
+async def check_stuck():
+    """Дошёл до оплаты, но через STUCK_HOURS так и не оплатил: один раз напоминаем."""
+    limit = iso(now() - timedelta(hours=STUCK_HOURS))
+    for u in db.execute("SELECT user_id FROM users WHERE active=0 AND stuck_reminded=0 "
+                        "AND pay_started_at IS NOT NULL AND pay_started_at<=?", (limit,)).fetchall():
+        db.execute("UPDATE users SET stuck_reminded=1 WHERE user_id=?", (u["user_id"],))
+        db.commit()
+        await safe_send(u["user_id"], T_STUCK, KB_STUCK)
 
 
 async def check_subscriptions():
@@ -239,7 +371,7 @@ async def check_subscriptions():
                 await new_payment(uid, u["method_id"])
             except Exception:
                 logging.exception("автосписание не удалось для %s", uid)
-                await safe_send(uid, "Не удалось списать оплату автоматически. Продлите вручную:", pay_kb())
+                await safe_send(uid, T_AUTO_FAIL, KB_RENEW)
         if left <= timedelta(days=REMIND_DAYS):
             key = u["expires_at"] if auto else today  # автоплатёж: 1 напоминание; иначе раз в день
             if u["last_remind"] != key:
@@ -247,15 +379,17 @@ async def check_subscriptions():
                 db.commit()
                 end = fmt(datetime.fromisoformat(u["expires_at"]))
                 if auto:
-                    await safe_send(uid, f"🔔 Подписка до {end}. Спишем {PRICE:.0f} ₽ автоматически. Отключить: /cancel")
+                    await safe_send(uid, T_REMIND_AUTO.format(end=end, price=f"{PRICE:.0f}"))
                 else:
-                    await safe_send(uid, f"🔔 Подписка заканчивается {end}. Продлить:", pay_kb())
+                    await safe_send(uid, T_REMIND.format(end=end), KB_RENEW)
 
 
 async def scheduler():
     while True:
         try:
-            await check_pending()
+            if not TEST_MODE:
+                await check_pending()
+            await check_stuck()
             await check_subscriptions()
         except Exception:
             logging.exception("ошибка фоновой проверки")
@@ -275,6 +409,12 @@ async def yk_hook(request: web.Request):
 
 
 async def main():
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Начать / оформить подписку"),
+        BotCommand(command="status", description="Статус подписки"),
+        BotCommand(command="help", description="Связаться с нами"),
+        BotCommand(command="cancel", description="Отключить автопродление"),
+    ])
     if WEBHOOK_PORT:
         app = web.Application()
         app.router.add_post("/yookassa", yk_hook)
