@@ -9,6 +9,7 @@ import html
 import logging
 import os
 import sqlite3
+import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -17,7 +18,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (BotCommand, CallbackQuery, FSInputFile, InlineKeyboardButton,
+                           InlineKeyboardMarkup, Message)
 from aiohttp import web
 from dotenv import load_dotenv
 from yookassa import Configuration, Payment
@@ -30,11 +32,16 @@ PRICE = float(os.getenv("PRICE", "2500"))         # цена за период, 
 PERIOD_DAYS = float(os.getenv("PERIOD_DAYS", "30"))
 REMIND_DAYS = float(os.getenv("REMIND_DAYS", "3"))    # за сколько дней напоминать о продлении
 STUCK_HOURS = float(os.getenv("STUCK_HOURS", "24"))   # через сколько часов напомнить «застрявшему» на оплате
-OFFER_URL = os.getenv("OFFER_URL", "")            # ссылка на публичную оферту
+OFFER_URL = os.getenv("OFFER_URL") or "https://disk.yandex.ru/d/E2dDsFUW5SX4mQ"  # ссылка на публичную оферту
 AUTOCHARGE = os.getenv("AUTOCHARGE", "0") == "1"  # автосписание (нужно включить у ЮKassa)
 TEST_MODE = os.getenv("TEST_MODE", "0") == "1"    # 1 = ЮKassa не подключена: «оплатить» может только админ
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "0"))    # 0 = вебхук выключен, только опрос
 RETURN_URL = os.getenv("RETURN_URL", "https://t.me/")
+# Папка с базой. На Bothost постоянное хранилище лежит в /app/data (тариф Basic и выше).
+DATA_DIR = os.getenv("DATA_DIR") or ("/app/data" if os.path.isdir("/app/data") else ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "bot.db")
+BACKUP_HOURS = float(os.getenv("BACKUP_HOURS", "24"))  # как часто бот присылает вам копию базы
 if not TEST_MODE:
     Configuration.configure(os.environ["YOOKASSA_SHOP_ID"], os.environ["YOOKASSA_SECRET"])
 
@@ -73,9 +80,9 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
 dp = Dispatcher()
 
-db = sqlite3.connect("bot.db")
+db = sqlite3.connect(DB_PATH)
 db.row_factory = sqlite3.Row
-db.executescript("""
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
   user_id INTEGER PRIMARY KEY, username TEXT, expires_at TEXT, method_id TEXT,
   autopay INTEGER DEFAULT 1, last_remind TEXT, last_charge TEXT, active INTEGER DEFAULT 0,
@@ -83,12 +90,22 @@ CREATE TABLE IF NOT EXISTS users(
 CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT);
 CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT);
 CREATE TABLE IF NOT EXISTS help(msg_id INTEGER PRIMARY KEY, user_id INTEGER);
-""")
-_cols = {r["name"] for r in db.execute("PRAGMA table_info(users)")}  # миграция старой базы
-for _name, _ddl in (("pay_started_at", "TEXT"), ("stuck_reminded", "INTEGER DEFAULT 0")):
-    if _name not in _cols:
-        db.execute(f"ALTER TABLE users ADD COLUMN {_name} {_ddl}")
-db.commit()
+CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+"""
+
+
+def migrate():
+    """Создаёт таблицы и дополняет старую базу новыми колонками."""
+    db.executescript(SCHEMA)
+    cols = {r["name"] for r in db.execute("PRAGMA table_info(users)")}
+    for name, ddl in (("pay_started_at", "TEXT"), ("stuck_reminded", "INTEGER DEFAULT 0")):
+        if name not in cols:
+            db.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
+    db.commit()
+
+
+migrate()
+logging.info("База данных: %s", os.path.abspath(DB_PATH))
 
 awaiting_help: set[int] = set()  # кто сейчас пишет вопрос администратору
 
@@ -115,9 +132,9 @@ def markup(*rows) -> InlineKeyboardMarkup:
 
 KB_START = markup([btn("💳 Оплатить", "buy")])
 KB_RENEW = markup([btn("💳 Продлить подписку", "buy")])
-KB_PAY = lambda: markup([btn(f"💳 Оплатить {PRICE:.0f} ₽", "pay")], [btn("🆘 Связаться", "help")])
-KB_STUCK = markup([btn("🆘 Связаться", "help")], [btn("💳 Оплатить", "buy")])
-KB_HELP = markup([btn("🆘 Связаться", "help")])
+KB_PAY = lambda: markup([btn(f"💳 Оплатить {PRICE:.0f} ₽", "pay")], [btn("💬 Связаться", "help")])
+KB_STUCK = markup([btn("💬 Связаться", "help")], [btn("💳 Оплатить", "buy")])
+KB_HELP = markup([btn("💬 Связаться", "help")])
 
 
 def ensure_user(uid: int, username: str | None):
@@ -243,7 +260,7 @@ async def pay(cb: CallbackQuery):
         return
     p = await new_payment(uid)
     kb = markup([InlineKeyboardButton(text="Перейти к оплате", url=p.confirmation.confirmation_url)],
-                [btn("🆘 Связаться", "help")])
+                [btn("💬 Связаться", "help")])
     await cb.message.answer(T_PAY_LINK, reply_markup=kb)
 
 
@@ -259,6 +276,60 @@ async def help_btn(cb: CallbackQuery):
     awaiting_help.add(cb.from_user.id)
     await cb.message.answer(T_HELP_PROMPT)
     await cb.answer()
+
+
+# ---------- Копии базы (под вашим контролем) ----------
+async def send_backup(reason: str = "авто"):
+    """Присылает админу в Telegram консистентную копию bot.db."""
+    db.execute("INSERT OR REPLACE INTO meta VALUES('last_backup', ?)", (iso(now()),))
+    db.commit()
+    path = os.path.join(tempfile.gettempdir(), f"bot-backup-{now():%Y%m%d-%H%M}.db")
+    dst = sqlite3.connect(path)
+    try:
+        db.backup(dst)
+    finally:
+        dst.close()
+    n = db.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0]
+    try:
+        await bot.send_document(ADMIN_ID, FSInputFile(path), caption=(
+            f"💾 Копия базы ({reason}). Активных подписчиков: {n}.\n"
+            "Восстановить: отправьте этот файл боту с подписью /restore"))
+    finally:
+        os.remove(path)
+
+
+@dp.message(Command("backup"))
+async def backup_cmd(m: Message):
+    if m.from_user.id == ADMIN_ID:
+        await send_backup("по запросу")
+
+
+@dp.message(F.from_user.id == ADMIN_ID, F.document)
+async def restore_cmd(m: Message):
+    """Файл базы + подпись /restore: полностью заменяет текущую базу."""
+    if not (m.caption or "").startswith("/restore"):
+        if m.reply_to_message:
+            await admin_reply(m)  # это ответ пользователю документом
+        else:
+            await m.answer("Чтобы восстановить базу, отправьте файл с подписью /restore")
+        return
+    path = os.path.join(tempfile.gettempdir(), f"restore-{uuid.uuid4().hex}.db")
+    try:
+        await bot.download(m.document, destination=path)
+        src = sqlite3.connect(path)
+        try:
+            n = src.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            src.backup(db)
+        finally:
+            src.close()
+        migrate()
+        await m.answer(f"✅ База восстановлена. Пользователей в ней: {n}.")
+    except Exception:
+        logging.exception("не удалось восстановить базу")
+        await m.answer("Не удалось восстановить: файл не похож на копию базы бота.")
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
 
 
 @dp.message(F.from_user.id == ADMIN_ID, F.reply_to_message)
@@ -311,18 +382,18 @@ async def stats(m: Message):
     n = db.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0]
     s = db.execute("SELECT COUNT(*) FROM payments").fetchone()[0]
     stuck = db.execute("SELECT COUNT(*) FROM users WHERE active=0 AND pay_started_at IS NOT NULL").fetchone()[0]
-    await m.answer(f"Активных подписчиков: {n}\nВсего оплат: {s}\nДошли до оплаты, но не оплатили: {stuck}")
+    await m.answer(f"Активных подписчиков: {n}\nВсего оплат: {s}\nДошли до оплаты, но не оплатили: {stuck}\nФайл базы: {os.path.abspath(DB_PATH)}")
 
 
 @dp.message()
 async def any_message(m: Message):
     """Всё остальное: либо вопрос администратору (после /help), либо подсказка."""
     uid = m.from_user.id
-    if uid in awaiting_help and uid != ADMIN_ID:
+    if uid in awaiting_help:
         awaiting_help.discard(uid)
         who = html.escape(m.from_user.full_name) + (f" (@{m.from_user.username})" if m.from_user.username else "")
         head = await bot.send_message(
-            ADMIN_ID, f"🆘 Вопрос от {who}, id <code>{uid}</code>.\nОтветьте реплаем на это сообщение или на следующее.")
+            ADMIN_ID, f"💬 Вопрос от {who}, id <code>{uid}</code>.\nОтветьте реплаем на это сообщение или на следующее.")
         copy = await m.copy_to(ADMIN_ID)
         db.executemany("INSERT OR REPLACE INTO help VALUES(?,?)", [(head.message_id, uid), (copy.message_id, uid)])
         db.commit()
@@ -384,12 +455,20 @@ async def check_subscriptions():
                     await safe_send(uid, T_REMIND.format(end=end), KB_RENEW)
 
 
+async def check_backup():
+    r = db.execute("SELECT v FROM meta WHERE k='last_backup'").fetchone()
+    if r and datetime.fromisoformat(r["v"]) > now() - timedelta(hours=BACKUP_HOURS):
+        return
+    await send_backup()
+
+
 async def scheduler():
     while True:
         try:
             if not TEST_MODE:
                 await check_pending()
             await check_stuck()
+            await check_backup()
             await check_subscriptions()
         except Exception:
             logging.exception("ошибка фоновой проверки")
