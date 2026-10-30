@@ -230,15 +230,18 @@ async def extend(uid: int, days: float, method_id: str | None = None):
         await safe_send(ADMIN_ID, f"⚠️ Не удалось выдать ссылку пользователю <code>{uid}</code>. Бот — админ канала?")
 
 
-async def expire(uid: int):
+async def expire(uid: int) -> bool:
+    removed = False
     try:
         await bot.ban_chat_member(CHANNEL_ID, uid)
         await bot.unban_chat_member(CHANNEL_ID, uid, only_if_banned=True)  # убрать, но не банить навсегда
+        removed = True
     except Exception:
         logging.exception("не удалось удалить %s из канала", uid)
     db.execute("UPDATE users SET active=0 WHERE user_id=?", (uid,))
     db.commit()
     await safe_send(uid, T_EXPIRED, KB_RENEW)
+    return removed
 
 
 # ---------- Воронка: /start -> оплата ----------
@@ -415,6 +418,41 @@ async def grant(m: Message):  # /grant 123456789 30 — выдать досту�
         await m.answer("Готово.")
     except ValueError:
         await m.answer("Формат: /grant ID дни")
+
+
+@dp.message(Command("del"))
+async def delete_subscription(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    parts = (m.text or "").split()
+    if len(parts) != 2:
+        await m.answer("Формат: /del @username или /del Telegram_ID")
+        return
+
+    target = parts[1].lstrip("@")
+    if target.isdigit():
+        row = db.execute("SELECT user_id FROM users WHERE user_id=?", (int(target),)).fetchone()
+    else:
+        row = db.execute("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (target,)).fetchone()
+    if not row:
+        await m.answer("Пользователь не найден в базе бота. Проверьте username или Telegram ID.")
+        return
+
+    uid = row["user_id"]
+    removed = await expire(uid)
+    db.execute(
+        "UPDATE users SET active=0, expires_at=NULL, method_id=NULL, "
+        "last_remind=NULL, last_charge=NULL WHERE user_id=?",
+        (uid,),
+    )
+    db.commit()
+    if removed:
+        await m.answer(f"Подписка пользователя <code>{uid}</code> сброшена, доступ в канал удалён.")
+    else:
+        await m.answer(
+            f"Подписка пользователя <code>{uid}</code> сброшена, но удалить его из канала не удалось. "
+            "Проверьте права бота и логи."
+        )
 
 
 @dp.message(Command("stats"))
