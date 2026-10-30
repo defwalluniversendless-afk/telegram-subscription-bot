@@ -34,7 +34,7 @@ REMIND_DAYS = float(os.getenv("REMIND_DAYS", "3"))    # за сколько дн
 STUCK_HOURS = float(os.getenv("STUCK_HOURS", "24"))   # через сколько часов напомнить «застрявшему» на оплате
 OFFER_URL = os.getenv("OFFER_URL") or "https://disk.yandex.ru/d/E2dDsFUW5SX4mQ"  # ссылка на публичную оферту
 AUTOCHARGE = os.getenv("AUTOCHARGE", "0") == "1"  # автосписание (нужно включить у ЮKassa)
-TEST_MODE = os.getenv("TEST_MODE", "0") == "1"    # 1 = ЮKassa не подключена: «оплатить» может только админ
+TEST_MODE = os.getenv("TEST_MODE", "0") == "1"    # 1 = локальная имитация оплаты без ЮKassa
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "0"))    # 0 = вебхук выключен, только опрос
 RETURN_URL = os.getenv("RETURN_URL", "https://t.me/")
 # Папка с базой. На Bothost постоянное хранилище лежит в /app/data (тариф Basic и выше).
@@ -57,7 +57,8 @@ T_OFFER_LINK = '<a href="{url}">публичной офертой</a>'
 T_OFFER_SOON = "публичной офертой (ссылка скоро появится)"
 T_PAY_LINK = "Ссылка на оплату готова. После оплаты доступ придёт сюда автоматически."
 T_NOT_READY = "Приём оплаты ещё настраивается, скоро всё заработает. Если вопрос срочный, нажмите «Связаться»."
-T_ACTIVE = "У вас уже есть доступ к каналу до {date}. Продлить подписку можно кнопкой ниже."
+T_ACTIVE = ("У вас уже есть активная подписка до {date}.\n"
+            "Если у вас есть вопросы, свяжитесь с нами.")
 T_STATUS_NO = "Подписки нет. Чтобы получить доступ, нажмите кнопку."
 T_PAID_NEW = ("✅ Оплата получена. Подписка до {date}.\n\n"
               "Ваша ссылка в канал (одноразовая, действует сутки):\n{link}")
@@ -86,7 +87,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
   user_id INTEGER PRIMARY KEY, username TEXT, expires_at TEXT, method_id TEXT,
   autopay INTEGER DEFAULT 1, last_remind TEXT, last_charge TEXT, active INTEGER DEFAULT 0,
-  pay_started_at TEXT, stuck_reminded INTEGER DEFAULT 0);
+  pay_started_at TEXT, stuck_reminded INTEGER DEFAULT 0, joined_at TEXT);
 CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT);
 CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT);
 CREATE TABLE IF NOT EXISTS help(msg_id INTEGER PRIMARY KEY, user_id INTEGER);
@@ -98,7 +99,8 @@ def migrate():
     """Создаёт таблицы и дополняет старую базу новыми колонками."""
     db.executescript(SCHEMA)
     cols = {r["name"] for r in db.execute("PRAGMA table_info(users)")}
-    for name, ddl in (("pay_started_at", "TEXT"), ("stuck_reminded", "INTEGER DEFAULT 0")):
+    for name, ddl in (("pay_started_at", "TEXT"), ("stuck_reminded", "INTEGER DEFAULT 0"),
+                      ("joined_at", "TEXT")):
         if name not in cols:
             db.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
     db.commit()
@@ -122,6 +124,11 @@ def fmt(d: datetime) -> str:
     return d.strftime("%d.%m.%Y")
 
 
+def active_subscription(uid: int):
+    row = db.execute("SELECT expires_at FROM users WHERE user_id=? AND active=1", (uid,)).fetchone()
+    return row if row and row["expires_at"] and datetime.fromisoformat(row["expires_at"]) > now() else None
+
+
 def btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
 
@@ -138,8 +145,9 @@ KB_HELP = markup([btn("💬 Связаться", "help")])
 
 
 def ensure_user(uid: int, username: str | None):
-    db.execute("INSERT INTO users(user_id, username) VALUES(?,?) "
-               "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username", (uid, username))
+    db.execute("INSERT INTO users(user_id, username, joined_at) VALUES(?,?,?) "
+               "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username",
+               (uid, username, iso(now())))
     db.commit()
 
 
@@ -183,6 +191,15 @@ async def handle_payment(p):
     db.commit()
     if cur.rowcount == 0:
         return
+    user = db.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
+    username = f" (@{user['username']})" if user and user["username"] else ""
+    amount = p.amount.value if p.amount else f"{PRICE:.2f}"
+    currency = p.amount.currency if p.amount else "RUB"
+    await safe_send(
+        ADMIN_ID,
+        f"💳 Получена оплата\nПользователь: <code>{uid}</code>{username}\n"
+        f"Сумма: {amount} {currency}\nПлатёж: <code>{html.escape(str(p.id))}</code>",
+    )
     method = p.payment_method.id if p.payment_method and getattr(p.payment_method, "saved", False) else None
     await extend(uid, PERIOD_DAYS, method)
 
@@ -229,8 +246,8 @@ async def expire(uid: int):
 async def start(m: Message):
     ensure_user(m.from_user.id, m.from_user.username)
     u = db.execute("SELECT * FROM users WHERE user_id=?", (m.from_user.id,)).fetchone()
-    if u["active"] and u["expires_at"]:
-        await m.answer(T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))), reply_markup=KB_RENEW)
+    if active_subscription(m.from_user.id):
+        await m.answer(T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))), reply_markup=KB_HELP)
         return
     await m.answer(T_WELCOME, reply_markup=KB_START)
 
@@ -239,6 +256,12 @@ async def start(m: Message):
 async def buy(cb: CallbackQuery):
     uid = cb.from_user.id
     ensure_user(uid, cb.from_user.username)
+    u = active_subscription(uid)
+    if u:
+        await cb.message.answer(T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))),
+                                reply_markup=KB_HELP)
+        await cb.answer()
+        return
     # человек дошёл до оплаты: запускаем таймер «застрял на оплате»
     db.execute("UPDATE users SET pay_started_at=?, stuck_reminded=0 WHERE user_id=? AND active=0", (iso(now()), uid))
     db.commit()
@@ -251,7 +274,13 @@ async def buy(cb: CallbackQuery):
 @dp.callback_query(F.data == "pay")
 async def pay(cb: CallbackQuery):
     uid = cb.from_user.id
+    ensure_user(uid, cb.from_user.username)
     await cb.answer()
+    u = active_subscription(uid)
+    if u:
+        await cb.message.answer(T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))),
+                                reply_markup=KB_HELP)
+        return
     if TEST_MODE:  # ЮKassa ещё не подключена: «оплатить» работает только у админа (для проверки)
         if uid == ADMIN_ID:
             await extend(uid, PERIOD_DAYS)
@@ -267,12 +296,14 @@ async def pay(cb: CallbackQuery):
 # ---------- Связь с владельцем ----------
 @dp.message(Command("help"))
 async def help_cmd(m: Message):
+    ensure_user(m.from_user.id, m.from_user.username)
     awaiting_help.add(m.from_user.id)
     await m.answer(T_HELP_PROMPT)
 
 
 @dp.callback_query(F.data == "help")
 async def help_btn(cb: CallbackQuery):
+    ensure_user(cb.from_user.id, cb.from_user.username)
     awaiting_help.add(cb.from_user.id)
     await cb.message.answer(T_HELP_PROMPT)
     await cb.answer()
@@ -335,12 +366,21 @@ async def restore_cmd(m: Message):
 @dp.message(F.from_user.id == ADMIN_ID, F.reply_to_message)
 async def admin_reply(m: Message):
     """Ответ админа реплаем на пересланный вопрос уходит автору вопроса."""
-    row = db.execute("SELECT user_id FROM help WHERE msg_id=?", (m.reply_to_message.message_id,)).fetchone()
-    if not row:
+    reply = m.reply_to_message
+    row = db.execute("SELECT user_id FROM help WHERE msg_id=?", (reply.message_id,)).fetchone()
+    uid = row["user_id"] if row else None
+    if uid is None and reply.from_user and reply.from_user.is_bot:
+        text = reply.text or reply.caption or ""
+        first_line = text.splitlines()[0] if text else ""
+        if first_line.startswith("💬 Вопрос от "):
+            digits = first_line.rsplit(", id ", 1)[-1].removesuffix(".").strip()
+            if digits.isdigit():
+                uid = int(digits)
+    if uid is None:
         await m.answer("Не нашёл, кому отвечать. Отвечайте реплаем именно на сообщение с вопросом.")
         return
     try:
-        await m.copy_to(row["user_id"])
+        await m.copy_to(uid)
         await m.answer("✅ Отправлено.")
     except Exception:
         await m.answer("Не удалось отправить: пользователь мог заблокировать бота.")
@@ -349,15 +389,17 @@ async def admin_reply(m: Message):
 # ---------- Остальные команды ----------
 @dp.message(Command("status"))
 async def status(m: Message):
-    u = db.execute("SELECT * FROM users WHERE user_id=?", (m.from_user.id,)).fetchone()
-    if u and u["active"] and u["expires_at"]:
-        await m.answer(f"Подписка активна до {fmt(datetime.fromisoformat(u['expires_at']))}.", reply_markup=KB_RENEW)
+    ensure_user(m.from_user.id, m.from_user.username)
+    u = active_subscription(m.from_user.id)
+    if u:
+        await m.answer(T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))), reply_markup=KB_HELP)
     else:
         await m.answer(T_STATUS_NO, reply_markup=KB_START)
 
 
 @dp.message(Command("cancel"))
 async def cancel(m: Message):
+    ensure_user(m.from_user.id, m.from_user.username)
     db.execute("UPDATE users SET autopay=0 WHERE user_id=?", (m.from_user.id,))
     db.commit()
     await m.answer(T_CANCEL)
@@ -389,6 +431,7 @@ async def stats(m: Message):
 async def any_message(m: Message):
     """Всё остальное: либо вопрос администратору (после /help), либо подсказка."""
     uid = m.from_user.id
+    ensure_user(uid, m.from_user.username)
     if uid in awaiting_help:
         awaiting_help.discard(uid)
         who = html.escape(m.from_user.full_name) + (f" (@{m.from_user.username})" if m.from_user.username else "")
@@ -462,9 +505,28 @@ async def check_backup():
     await send_backup()
 
 
+async def check_daily_report():
+    """Раз в день сообщает админу число новых пользователей за текущий день по UTC."""
+    day = now().date()
+    day_key = day.isoformat()
+    last = db.execute("SELECT v FROM meta WHERE k='last_daily_report'").fetchone()
+    if last and last["v"] == day_key:
+        return
+    start = datetime.combine(day, datetime.min.time())
+    end = start + timedelta(days=1)
+    count = db.execute(
+        "SELECT COUNT(*) FROM users WHERE user_id!=? AND joined_at>=? AND joined_at<?",
+        (ADMIN_ID, iso(start), iso(end)),
+    ).fetchone()[0]
+    await bot.send_message(ADMIN_ID, f"📊 Новых пользователей за {day.strftime('%d.%m.%Y')}: {count}")
+    db.execute("INSERT OR REPLACE INTO meta VALUES('last_daily_report', ?)", (day_key,))
+    db.commit()
+
+
 async def scheduler():
     while True:
         try:
+            await check_daily_report()
             if not TEST_MODE:
                 await check_pending()
             await check_stuck()
