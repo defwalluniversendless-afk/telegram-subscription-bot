@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -76,6 +77,7 @@ T_HELP_PROMPT = ("Опишите проблему или вопрос одним
 T_HELP_SENT = "Передал. Ответим вам здесь, как только сможем."
 T_UNKNOWN = "Не понял сообщение. Нажмите /start, чтобы начать, или /help, чтобы связаться с нами."
 T_CANCEL = "Автопродление отключено. Доступ сохранится до конца оплаченного срока."
+T_BLOCKED = "Доступ к этому боту ограничен. Если вы считаете, что это ошибка, свяжитесь с администратором."
 # ===================================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -88,9 +90,11 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
   user_id INTEGER PRIMARY KEY, username TEXT, expires_at TEXT, method_id TEXT,
   autopay INTEGER DEFAULT 1, last_remind TEXT, last_charge TEXT, active INTEGER DEFAULT 0,
-  pay_started_at TEXT, stuck_reminded INTEGER DEFAULT 0, joined_at TEXT);
+  pay_started_at TEXT, stuck_reminded INTEGER DEFAULT 0, joined_at TEXT,
+  blocked INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT);
-CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT);
+CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT,
+  is_auto INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS help(msg_id INTEGER PRIMARY KEY, user_id INTEGER);
 CREATE TABLE IF NOT EXISTS support_links(
   chat_id INTEGER, message_id INTEGER, user_id INTEGER,
@@ -104,14 +108,35 @@ def migrate():
     db.executescript(SCHEMA)
     cols = {r["name"] for r in db.execute("PRAGMA table_info(users)")}
     for name, ddl in (("pay_started_at", "TEXT"), ("stuck_reminded", "INTEGER DEFAULT 0"),
-                      ("joined_at", "TEXT")):
+                      ("joined_at", "TEXT"), ("blocked", "INTEGER DEFAULT 0")):
         if name not in cols:
             db.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
+    pending_cols = {r["name"] for r in db.execute("PRAGMA table_info(pending)")}
+    if "is_auto" not in pending_cols:
+        db.execute("ALTER TABLE pending ADD COLUMN is_auto INTEGER DEFAULT 0")
     db.commit()
 
 
 migrate()
 logging.info("База данных: %s", os.path.abspath(DB_PATH))
+
+
+class BlockedUserMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = event.from_user
+        if user and user.id != ADMIN_ID:
+            row = db.execute("SELECT blocked FROM users WHERE user_id=?", (user.id,)).fetchone()
+            if row and row["blocked"]:
+                if isinstance(event, Message):
+                    await event.answer(T_BLOCKED)
+                elif isinstance(event, CallbackQuery):
+                    await event.answer(T_BLOCKED, show_alert=True)
+                return None
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(BlockedUserMiddleware())
+dp.callback_query.outer_middleware(BlockedUserMiddleware())
 
 awaiting_help: set[int] = set()  # кто сейчас пишет вопрос администратору
 awaiting_custom_days: dict[int, tuple[int, int, int, int]] = {}  # user_id, страница, панель, запрос срока
@@ -198,8 +223,10 @@ def _create_payment(user_id: int, method_id: str | None = None):
 
 
 async def new_payment(user_id: int, method_id: str | None = None):
+    is_auto = method_id is not None
     p = await asyncio.to_thread(_create_payment, user_id, method_id)
-    db.execute("INSERT OR IGNORE INTO pending VALUES(?,?,?)", (p.id, user_id, iso(now())))
+    db.execute("INSERT OR IGNORE INTO pending(id, user_id, created, is_auto) VALUES(?,?,?,?)",
+               (p.id, user_id, iso(now()), int(is_auto)))
     db.commit()
     return p
 
@@ -253,7 +280,7 @@ async def extend(uid: int, days: float, method_id: str | None = None):
         await safe_send(ADMIN_ID, f"⚠️ Не удалось выдать ссылку пользователю <code>{uid}</code>. Бот — админ канала?")
 
 
-async def expire(uid: int) -> bool:
+async def expire(uid: int, notify_user: bool = True) -> bool:
     removed = False
     try:
         await bot.ban_chat_member(CHANNEL_ID, uid)
@@ -263,14 +290,15 @@ async def expire(uid: int) -> bool:
         logging.exception("не удалось удалить %s из канала", uid)
     db.execute("UPDATE users SET active=0 WHERE user_id=?", (uid,))
     db.commit()
-    await safe_send(uid, T_EXPIRED, KB_RENEW)
+    if notify_user:
+        await safe_send(uid, T_EXPIRED, KB_RENEW)
     return removed
 
 
-async def reset_subscription(uid: int) -> bool:
-    removed = await expire(uid)
+async def reset_subscription(uid: int, notify_user: bool = True) -> bool:
+    removed = await expire(uid, notify_user)
     db.execute(
-        "UPDATE users SET active=0, expires_at=NULL, method_id=NULL, "
+        "UPDATE users SET active=0, expires_at=NULL, method_id=NULL, autopay=0, "
         "last_remind=NULL, last_charge=NULL, pay_started_at=NULL, stuck_reminded=0 "
         "WHERE user_id=?",
         (uid,),
@@ -323,12 +351,6 @@ async def start(m: Message):
 async def buy(cb: CallbackQuery):
     uid = cb.from_user.id
     ensure_user(uid, cb.from_user.username)
-    u = active_subscription(uid)
-    if u:
-        await cb.message.answer(T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))),
-                                reply_markup=KB_HELP)
-        await cb.answer()
-        return
     # человек дошёл до оплаты: запускаем таймер «застрял на оплате»
     db.execute("UPDATE users SET pay_started_at=?, stuck_reminded=0 WHERE user_id=? AND active=0", (iso(now()), uid))
     db.commit()
@@ -343,11 +365,6 @@ async def pay(cb: CallbackQuery):
     uid = cb.from_user.id
     ensure_user(uid, cb.from_user.username)
     await cb.answer()
-    u = active_subscription(uid)
-    if u:
-        await cb.message.answer(T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))),
-                                reply_markup=KB_HELP)
-        return
     if TEST_MODE:  # ЮKassa ещё не подключена: «оплатить» работает только у админа (для проверки)
         if uid == ADMIN_ID:
             await extend(uid, PERIOD_DAYS)
@@ -521,7 +538,7 @@ def users_page(page: int):
     pages = max(1, (count + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     rows = db.execute(
-        "SELECT user_id, username, expires_at, active FROM users "
+        "SELECT user_id, username, expires_at, active, blocked FROM users "
         "ORDER BY user_id DESC LIMIT ? OFFSET ?",
         (USERS_PAGE_SIZE, page * USERS_PAGE_SIZE),
     ).fetchall()
@@ -536,6 +553,8 @@ def users_page(page: int):
             subscription = f"неактивна (срок был до {fmt(datetime.fromisoformat(row['expires_at']))})"
         else:
             subscription = "подписки нет"
+        if row["blocked"]:
+            subscription += "; заблокирован"
         lines.append(f"• {username}<code>{uid}</code> — {subscription}")
         label = f"@{row['username']}" if row["username"] else str(uid)
         keyboard_rows.append([btn(label[:40], f"users:view:{uid}:{page}")])
@@ -552,7 +571,7 @@ def users_page(page: int):
 
 def user_details(uid: int, page: int):
     row = db.execute(
-        "SELECT user_id, username, expires_at, active FROM users WHERE user_id=?",
+        "SELECT user_id, username, expires_at, active, blocked FROM users WHERE user_id=?",
         (uid,),
     ).fetchone()
     if not row:
@@ -564,6 +583,8 @@ def user_details(uid: int, page: int):
         subscription = f"Неактивна (срок был до {fmt(datetime.fromisoformat(row['expires_at']))})"
     else:
         subscription = "Подписки нет"
+    if row["blocked"]:
+        subscription += "\nСтатус бота: заблокирован"
     text = f"<b>Пользователь</b>\nID: <code>{uid}</code>\nUsername: {username}\nПодписка: {subscription}"
     keyboard = markup(
         [btn("➕ Продлить на 30 дней", f"users:extend30:{uid}:{page}")],
@@ -687,14 +708,116 @@ async def delete_subscription(m: Message):
         )
 
 
+async def broadcast(m: Message, active_only: bool):
+    if m.from_user.id != ADMIN_ID:
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        command = "/all_sub" if active_only else "/all"
+        await m.answer(f"Формат: {command} текст сообщения")
+        return
+    body = html.escape(parts[1].strip())
+    query = "SELECT user_id FROM users WHERE blocked=0 AND user_id!=?"
+    params: tuple = (ADMIN_ID,)
+    if active_only:
+        query += " AND active=1 AND expires_at>?"
+        params += (iso(now()),)
+    recipients = db.execute(query, params).fetchall()
+    sent = failed = 0
+    for row in recipients:
+        try:
+            await bot.send_message(row["user_id"], body)
+            sent += 1
+        except Exception:
+            logging.exception("не удалось отправить рассылку пользователю %s", row["user_id"])
+            failed += 1
+        await asyncio.sleep(0.04)
+    await m.answer(
+        f"Рассылка завершена.\nПолучателей: {len(recipients)}\n"
+        f"Отправлено: {sent}\nНе доставлено: {failed}"
+    )
+
+
+@dp.message(Command("all"))
+async def broadcast_all(m: Message):
+    await broadcast(m, active_only=False)
+
+
+@dp.message(Command("all_sub"))
+async def broadcast_active(m: Message):
+    await broadcast(m, active_only=True)
+
+
+@dp.message(Command("block"))
+async def block_user(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    parts = (m.text or "").split()
+    if len(parts) != 2:
+        await m.answer("Формат: /block @username или /block Telegram_ID")
+        return
+    target = parts[1].lstrip("@")
+    if target.isdigit():
+        row = db.execute("SELECT user_id FROM users WHERE user_id=?", (int(target),)).fetchone()
+    else:
+        row = db.execute("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (target,)).fetchone()
+    if not row:
+        await m.answer("Пользователь не найден в базе бота.")
+        return
+    uid = row["user_id"]
+    if uid == ADMIN_ID:
+        await m.answer("Нельзя заблокировать администратора.")
+        return
+    removed = await reset_subscription(uid, notify_user=False)
+    db.execute("UPDATE users SET blocked=1 WHERE user_id=?", (uid,))
+    db.commit()
+    result = "из канала удалён" if removed else "не удалось удалить из канала — проверьте права бота"
+    await m.answer(
+        f"Пользователь <code>{uid}</code> заблокирован в боте и {result}. "
+        "Записи и история сохранены; пользователь больше не сможет пользоваться ботом."
+    )
+
+
+@dp.message(Command("unblock"))
+async def unblock_user(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    parts = (m.text or "").split()
+    if len(parts) != 2:
+        await m.answer("Формат: /unblock @username или /unblock Telegram_ID")
+        return
+    target = parts[1].lstrip("@")
+    if target.isdigit():
+        row = db.execute("SELECT user_id FROM users WHERE user_id=?", (int(target),)).fetchone()
+    else:
+        row = db.execute("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (target,)).fetchone()
+    if not row:
+        await m.answer("Пользователь не найден в базе бота.")
+        return
+    db.execute("UPDATE users SET blocked=0 WHERE user_id=?", (row["user_id"],))
+    db.commit()
+    await m.answer(f"Блокировка пользователя <code>{row['user_id']}</code> снята.")
+
+
 @dp.message(Command("stats"))
 async def stats(m: Message):
     if m.from_user.id != ADMIN_ID:
         return
     n = db.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0]
     s = db.execute("SELECT COUNT(*) FROM payments").fetchone()[0]
+    recurring = db.execute(
+        "SELECT COUNT(*) FROM users WHERE active=1 AND autopay=1 AND method_id IS NOT NULL"
+    ).fetchone()[0]
+    pending_auto = db.execute("SELECT COUNT(*) FROM pending WHERE is_auto=1").fetchone()[0]
     stuck = db.execute("SELECT COUNT(*) FROM users WHERE active=0 AND pay_started_at IS NOT NULL").fetchone()[0]
-    await m.answer(f"Активных подписчиков: {n}\nВсего оплат: {s}\nДошли до оплаты, но не оплатили: {stuck}\nФайл базы: {os.path.abspath(DB_PATH)}")
+    await m.answer(
+        f"Активных подписчиков: {n}\nВсего оплат: {s}\n"
+        f"Автосписание включено в настройках: {'да' if AUTOCHARGE else 'нет'}\n"
+        f"Активных подписок с сохранённым способом оплаты: {recurring}\n"
+        f"Ожидающих автоплатежей: {pending_auto}\n"
+        f"Дошли до оплаты, но не оплатили: {stuck}\n"
+        f"Файл базы: {os.path.abspath(DB_PATH)}"
+    )
 
 
 @dp.message()
@@ -732,16 +855,20 @@ async def any_message(m: Message):
 
 # ---------- Фоновая проверка ----------
 async def check_pending():
-    for r in db.execute("SELECT id, created FROM pending").fetchall():
+    for r in db.execute("SELECT id, created, user_id, is_auto FROM pending").fetchall():
         try:
             p = await asyncio.to_thread(Payment.find_one, r["id"])
         except Exception:
+            logging.exception("не удалось проверить платёж %s", r["id"])
             continue
         if p.status == "succeeded":
             await handle_payment(p)
         elif p.status == "canceled" or datetime.fromisoformat(r["created"]) < now() - timedelta(days=2):
             db.execute("DELETE FROM pending WHERE id=?", (r["id"],))
             db.commit()
+            if r["is_auto"] and p.status == "canceled":
+                logging.warning("автоплатёж %s отменён для пользователя %s", r["id"], r["user_id"])
+                await safe_send(r["user_id"], T_AUTO_FAIL, KB_RENEW)
 
 
 async def check_stuck():
@@ -763,11 +890,14 @@ async def check_subscriptions():
             await expire(uid)
             continue
         auto = bool(AUTOCHARGE and u["autopay"] and u["method_id"])
-        if auto and left <= timedelta(days=1) and u["last_charge"] != today:
-            db.execute("UPDATE users SET last_charge=? WHERE user_id=?", (today, uid))
-            db.commit()
+        has_pending_auto = db.execute(
+            "SELECT 1 FROM pending WHERE user_id=? AND is_auto=1 LIMIT 1", (uid,)
+        ).fetchone()
+        if auto and not has_pending_auto and left <= timedelta(days=1) and u["last_charge"] != today:
             try:
                 await new_payment(uid, u["method_id"])
+                db.execute("UPDATE users SET last_charge=? WHERE user_id=?", (today, uid))
+                db.commit()
             except Exception:
                 logging.exception("автосписание не удалось для %s", uid)
                 await safe_send(uid, T_AUTO_FAIL, KB_RENEW)
@@ -851,6 +981,10 @@ async def main():
         BotCommand(command="del", description="Сбросить подписку"),
         BotCommand(command="stats", description="Статистика бота"),
         BotCommand(command="backup", description="Копия базы данных"),
+        BotCommand(command="all", description="Сообщение всем пользователям"),
+        BotCommand(command="all_sub", description="Сообщение активным подписчикам"),
+        BotCommand(command="block", description="Заблокировать пользователя"),
+        BotCommand(command="unblock", description="Снять блокировку пользователя"),
     ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     if WEBHOOK_PORT:
         app = web.Application()
