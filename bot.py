@@ -628,6 +628,7 @@ def subscription_status(uid: int):
         [btn("🔕 Отключить автосписание", "status:disable")],
         [btn("🔔 Включить автосписание", "status:enable")],
         [btn("💳 Изменить способ оплаты", "status:change_method")],
+        [btn("🗑 Удалить способ оплаты", "status:delete_method")],
         [btn("💬 Связаться с нами", "help")],
     )
     return text, keyboard
@@ -656,6 +657,16 @@ async def status_action(cb: CallbackQuery):
         db.execute("UPDATE users SET autopay=1, last_charge=NULL WHERE user_id=?", (uid,))
         db.commit()
         await cb.answer("Автосписание включено.")
+    elif action == "delete_method":
+        if not row or not row["method_id"]:
+            await cb.answer("Сохранённого способа оплаты нет.", show_alert=True)
+            return
+        db.execute(
+            "UPDATE users SET method_id=NULL, autopay=0, last_charge=NULL WHERE user_id=?",
+            (uid,),
+        )
+        db.commit()
+        await cb.answer("Способ оплаты удалён, автосписание отключено.")
     elif action == "change_method":
         await cb.message.answer(
             "Как вы хотите изменить способ оплаты?",
