@@ -75,7 +75,14 @@ T_PAID_NOLINK = ("✅ Оплата получена, но ссылку выда�
 T_REMIND = "🔔 Подписка заканчивается {end}. Чтобы не потерять доступ, продлите её:"
 T_REMIND_AUTO = "🔔 Подписка до {end}. Спишем {price} ₽ автоматически. Отключить автопродление: /cancel"
 T_AUTO_FAIL = "Не удалось списать оплату автоматически. Продлите вручную:"
-T_EXPIRED = "⏰ Подписка закончилась, доступ к каналу закрыт. Продлить:"
+T_MAINTENANCE_GRACE = (
+    "⏸️ Пока бот был на технических работах, срок вашей подписки закончился. "
+    "У вас есть 3 дня, чтобы продлить её и сохранить доступ к каналу:"
+)
+T_EXPIRED = (
+    "⏰ Срок подписки закончился, доступ к каналу закрыт. Оплатите продление, "
+    "и доступ будет восстановлен:"
+)
 T_STUCK = ("Вижу, вы застопорились на моменте оплаты. Что-то не так?\n"
            "Если не получается оплатить или остались вопросы, нажмите «Связаться», и мы поможем.")
 T_HELP_PROMPT = ("Опишите проблему или вопрос одним сообщением (можно приложить скриншот). "
@@ -97,7 +104,7 @@ CREATE TABLE IF NOT EXISTS users(
   user_id INTEGER PRIMARY KEY, username TEXT, expires_at TEXT, method_id TEXT,
   autopay INTEGER DEFAULT 1, last_remind TEXT, last_charge TEXT, active INTEGER DEFAULT 0,
   pay_started_at TEXT, stuck_reminded INTEGER DEFAULT 0, joined_at TEXT,
-  blocked INTEGER DEFAULT 0, method_mode TEXT);
+  blocked INTEGER DEFAULT 0, method_mode TEXT, grace_until TEXT);
 CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT);
 CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT,
   is_auto INTEGER DEFAULT 0, store_mode TEXT);
@@ -121,6 +128,8 @@ def migrate():
             db.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
     if "method_mode" not in cols:
         db.execute("ALTER TABLE users ADD COLUMN method_mode TEXT")
+    if "grace_until" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN grace_until TEXT")
     pending_cols = {r["name"] for r in db.execute("PRAGMA table_info(pending)")}
     if "is_auto" not in pending_cols:
         db.execute("ALTER TABLE pending ADD COLUMN is_auto INTEGER DEFAULT 0")
@@ -130,7 +139,7 @@ def migrate():
     if "store_mode" not in pending_method_cols:
         db.execute("ALTER TABLE pending_methods ADD COLUMN store_mode TEXT")
     db.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('payment_store_mode',?)", (PAYMENT_STORE_MODE,))
-    db.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('maintenance_mode','0')")
+    db.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('maintenance_mode','1')")
     db.execute(
         "UPDATE users SET method_mode=(SELECT v FROM meta WHERE k='payment_store_mode') "
         "WHERE method_id IS NOT NULL AND method_mode IS NULL"
@@ -235,14 +244,48 @@ def maintenance_enabled() -> bool:
     return bool(row and row["v"] == "1")
 
 
+async def set_maintenance_mode(enabled: bool):
+    currently_enabled = maintenance_enabled()
+    if enabled == currently_enabled:
+        return
+    if enabled:
+        db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('maintenance_started_at',?)", (iso(now()),))
+        db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('maintenance_mode','1')")
+        db.commit()
+        return
+
+    started = db.execute(
+        "SELECT v FROM meta WHERE k='maintenance_started_at'"
+    ).fetchone()
+    resumed_at = now()
+    expired_during_maintenance = []
+    if started:
+        expired_during_maintenance = db.execute(
+            "SELECT user_id FROM users WHERE active=1 AND expires_at IS NOT NULL "
+            "AND expires_at<=? AND expires_at>? AND blocked=0",
+            (iso(resumed_at), started["v"]),
+        ).fetchall()
+    grace_until = iso(resumed_at + timedelta(days=3))
+    for row in expired_during_maintenance:
+        db.execute(
+            "UPDATE users SET grace_until=?, last_remind=NULL WHERE user_id=?",
+            (grace_until, row["user_id"]),
+        )
+    db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('maintenance_mode','0')")
+    db.execute("DELETE FROM meta WHERE k='maintenance_started_at'")
+    db.commit()
+    for row in expired_during_maintenance:
+        await safe_send(row["user_id"], T_MAINTENANCE_GRACE, KB_RENEW)
+
+
 def maintenance_keyboard():
     return markup([btn("💬 Связаться с поддержкой", "help")])
 
 
 def maintenance_message():
     return (
-        "Сейчас бот находится на технических работах. Новые подписки временно недоступны.\n"
-        "Все подписки сохранены. Узнать статус своей подписки можно командой /status."
+        "Сейчас бот находится на технических работах. Оформление и продление подписок временно остановлены.\n"
+        "Все подписки и оставшиеся сроки сохранены. Узнать статус можно командой /status."
     )
 
 
@@ -325,6 +368,8 @@ def _create_payment(user_id: int, method_id: str | None = None,
 async def new_payment(user_id: int, method_id: str | None = None,
                       save_payment_method: bool | None = None, replace_method: bool = False):
     is_auto = method_id is not None
+    if is_auto and maintenance_enabled():
+        raise RuntimeError("Автосписания приостановлены на время технических работ.")
     store_mode = get_store_mode()
     if method_id:
         user = db.execute("SELECT method_mode FROM users WHERE user_id=?", (user_id,)).fetchone()
@@ -447,7 +492,7 @@ async def extend(uid: int, days: float, method_id: str | None = None,
                                    WHEN excluded.method_id IS NOT NULL THEN excluded.method_mode
                                    ELSE users.method_mode END,
                   autopay=CASE WHEN ? AND excluded.method_id IS NULL THEN 0 ELSE users.autopay END,
-                  pay_started_at=NULL, stuck_reminded=0""",
+                  pay_started_at=NULL, stuck_reminded=0, grace_until=NULL""",
                (uid, iso(new_exp), method_id, method_mode if method_id else None,
                 int(replace_method), int(replace_method), int(replace_method)))
     db.commit()
@@ -477,7 +522,7 @@ async def expire(uid: int, notify_user: bool = True) -> bool:
         removed = True
     except Exception:
         logging.exception("не удалось удалить %s из канала", uid)
-    db.execute("UPDATE users SET active=0 WHERE user_id=?", (uid,))
+    db.execute("UPDATE users SET active=0, grace_until=NULL WHERE user_id=?", (uid,))
     db.commit()
     if notify_user:
         await safe_send(uid, T_EXPIRED, KB_RENEW)
@@ -488,7 +533,7 @@ async def reset_subscription(uid: int, notify_user: bool = True) -> bool:
     removed = await expire(uid, notify_user)
     db.execute(
         "UPDATE users SET active=0, expires_at=NULL, method_id=NULL, autopay=0, "
-        "last_remind=NULL, last_charge=NULL, pay_started_at=NULL, stuck_reminded=0 "
+        "last_remind=NULL, last_charge=NULL, pay_started_at=NULL, stuck_reminded=0, grace_until=NULL "
         "WHERE user_id=?",
         (uid,),
     )
@@ -506,7 +551,7 @@ async def set_subscription_days(uid: int, days: float):
     )
     new_exp = now() + timedelta(days=days)
     db.execute(
-        "UPDATE users SET expires_at=?, active=1, last_remind=NULL, last_charge=NULL, "
+        "UPDATE users SET expires_at=?, active=1, last_remind=NULL, last_charge=NULL, grace_until=NULL, "
         "pay_started_at=NULL, stuck_reminded=0 WHERE user_id=?",
         (iso(new_exp), uid),
     )
@@ -550,7 +595,7 @@ async def start(m: Message):
 async def buy(cb: CallbackQuery):
     uid = cb.from_user.id
     ensure_user(uid, cb.from_user.username)
-    if maintenance_enabled() and uid != ADMIN_ID and not active_subscription(uid):
+    if maintenance_enabled() and uid != ADMIN_ID:
         await cb.message.answer(maintenance_message(), reply_markup=maintenance_keyboard())
         await cb.answer()
         return
@@ -568,7 +613,7 @@ async def pay(cb: CallbackQuery):
     uid = cb.from_user.id
     ensure_user(uid, cb.from_user.username)
     await cb.answer()
-    if maintenance_enabled() and uid != ADMIN_ID and not active_subscription(uid):
+    if maintenance_enabled() and uid != ADMIN_ID:
         await cb.message.answer(maintenance_message(), reply_markup=maintenance_keyboard())
         return
     if TEST_MODE:  # ЮKassa ещё не подключена: «оплатить» работает только у админа (для проверки)
@@ -757,13 +802,13 @@ def admin_menu():
         f"С включённым автопродлением в выбранном магазине: <b>{recurring}</b>\n"
         f"Ориентировочные списания за следующий период: <b>{revenue:,.0f} ₽</b> "
         f"({PRICE:,.0f} ₽ × {recurring}; не гарантия фактической выручки)\n\n"
-        f"Приём новых подписок: <b>{'выключен (техработы)' if maintenance else 'включён'}</b>\n"
+        f"Тех. режим: <b>{'запущен' if maintenance else 'не запущен'}</b>\n"
         f"{store_status}\n"
         f"Доступность ключей: тестовый — {'есть' if test_available else 'нет'}, "
         f"реальный — {'есть' if live_available else 'нет'}."
     )
     keyboard = markup(
-        [btn("🛠 Выключить приём подписок" if not maintenance else "✅ Включить бота",
+        [btn("🛠 Включить тех. режим" if not maintenance else "✅ Выключить тех. режим",
              "menu:maintenance_off" if not maintenance else "menu:maintenance_on")],
         [btn("🧪 Переключиться на тестовый магазин", "menu:store_test")],
         [btn("⚠️ Запросить переключение на реальный", "menu:store_live")],
@@ -787,13 +832,11 @@ async def menu_action(cb: CallbackQuery):
         return
     action = cb.data.split(":", 1)[1]
     if action == "maintenance_off":
-        db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('maintenance_mode','1')")
-        db.commit()
+        await set_maintenance_mode(True)
         await cb.answer("Новые подписки временно отключены.")
     elif action == "maintenance_on":
-        db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('maintenance_mode','0')")
-        db.commit()
-        await cb.answer("Приём подписок включён.")
+        await set_maintenance_mode(False)
+        await cb.answer("Приём подписок включён. Подписчикам с истёкшим сроком дано 3 дня на продление.")
     elif action == "store_test":
         if not available_store("test"):
             await cb.answer("Нет тестовых ключей ЮKassa в окружении.", show_alert=True)
@@ -829,10 +872,39 @@ async def menu_action(cb: CallbackQuery):
 
 def subscription_status(uid: int):
     row = db.execute(
-        "SELECT expires_at, method_id, method_mode, autopay FROM users WHERE user_id=?", (uid,)
+        "SELECT expires_at, method_id, method_mode, autopay, grace_until FROM users WHERE user_id=?",
+        (uid,),
     ).fetchone()
-    if row and active_subscription(uid):
+    is_active = bool(active_subscription(uid))
+    if not is_active and uid != ADMIN_ID:
+        if maintenance_enabled():
+            state = "Активной подписки нет."
+            if row and row["expires_at"]:
+                state = f"Подписка истекла <b>{fmt(datetime.fromisoformat(row['expires_at']))}</b>."
+            return (
+                f"{state}\n"
+                "Сейчас бот находится на технических работах, поэтому форма оплаты временно недоступна.",
+                maintenance_keyboard(),
+            )
+        if row and row["grace_until"] and datetime.fromisoformat(row["grace_until"]) > now():
+            text = (
+                "Срок подписки закончился. Продлите её до "
+                f"<b>{fmt(datetime.fromisoformat(row['grace_until']))}</b>, чтобы сохранить доступ."
+            )
+        elif row and row["expires_at"]:
+            text = (
+                "Ваша подписка истекла "
+                f"<b>{fmt(datetime.fromisoformat(row['expires_at']))}</b>. "
+                "Оформите её снова, чтобы восстановить доступ."
+            )
+        else:
+            text = "Активной подписки нет. Чтобы получить доступ, оформите подписку."
+        return text, markup([btn("💳 Оформить / продлить подписку", "buy")])
+
+    if is_active:
         subscription = f"Подписка активна до <b>{fmt(datetime.fromisoformat(row['expires_at']))}</b>."
+    elif row and row["expires_at"]:
+        subscription = f"Подписка истекла <b>{fmt(datetime.fromisoformat(row['expires_at']))}</b>."
     else:
         subscription = "Активной подписки нет."
     has_method = bool(row and row["method_id"])
@@ -866,6 +938,17 @@ async def status_action(cb: CallbackQuery):
     uid = cb.from_user.id
     row = db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
     action = cb.data.split(":", 1)[1]
+    if maintenance_enabled() and uid != ADMIN_ID and action in {
+        "change_method", "change_paid", "change_free"
+    }:
+        await cb.message.answer(maintenance_message(), reply_markup=maintenance_keyboard())
+        await cb.answer()
+        return
+    if not active_subscription(uid) and uid != ADMIN_ID:
+        text, keyboard = subscription_status(uid)
+        await cb.message.edit_text(text, reply_markup=keyboard)
+        await cb.answer()
+        return
     if action == "disable":
         if row:
             db.execute("UPDATE users SET autopay=0 WHERE user_id=?", (uid,))
@@ -1335,12 +1418,16 @@ async def check_stuck():
 
 
 async def check_subscriptions():
+    if maintenance_enabled():
+        return
     t = now()
     today = t.date().isoformat()
     store_mode = get_store_mode()
     for u in db.execute("SELECT * FROM users WHERE active=1 AND expires_at IS NOT NULL").fetchall():
         uid, left = u["user_id"], datetime.fromisoformat(u["expires_at"]) - t
         if left <= timedelta(0):
+            if u["grace_until"] and datetime.fromisoformat(u["grace_until"]) > t:
+                continue
             await expire(uid)
             continue
         auto = bool(
