@@ -24,7 +24,7 @@ from aiogram.types import (BotCommand, CallbackQuery, FSInputFile, InlineKeyboar
                            BotCommandScopeChat, InlineKeyboardMarkup, Message)
 from aiohttp import web
 from dotenv import load_dotenv
-from yookassa import Configuration, Payment
+from yookassa import Configuration, Payment, PaymentMethod
 
 load_dotenv()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -62,10 +62,15 @@ T_NOT_READY = "Приём оплаты ещё настраивается, ско
 T_ACTIVE = ("У вас уже есть активная подписка до {date}.\n"
             "Если у вас есть вопросы, свяжитесь с нами.")
 T_STATUS_NO = "Подписки нет. Чтобы получить доступ, нажмите кнопку."
-T_PAID_NEW = ("✅ Оплата получена. Подписка до {date}.\n\n"
+T_PAID_NEW = ("✅ Оплата получена. Подписка до {date}.\n"
+              "{autopay_status}\n"
+              "Управление подпиской и автосписанием: /status\n\n"
               "Ваша ссылка в канал (одноразовая, действует сутки):\n{link}")
-T_PAID_EXT = "✅ Подписка продлена до {date}."
-T_PAID_NOLINK = "✅ Оплата получена, но ссылку выдать не удалось. Нажмите /help, и мы всё решим."
+T_PAID_EXT = ("✅ Подписка продлена до {date}.\n"
+              "{autopay_status}\n"
+              "Управление подпиской и автосписанием: /status")
+T_PAID_NOLINK = ("✅ Оплата получена, но ссылку выдать не удалось. Нажмите /help, и мы всё решим.\n"
+                 "{autopay_status}\nУправление подпиской: /status")
 T_REMIND = "🔔 Подписка заканчивается {end}. Чтобы не потерять доступ, продлите её:"
 T_REMIND_AUTO = "🔔 Подписка до {end}. Спишем {price} ₽ автоматически. Отключить автопродление: /cancel"
 T_AUTO_FAIL = "Не удалось списать оплату автоматически. Продлите вручную:"
@@ -95,6 +100,8 @@ CREATE TABLE IF NOT EXISTS users(
 CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT);
 CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT,
   is_auto INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS pending_methods(
+  id TEXT PRIMARY KEY, user_id INTEGER, created TEXT, confirmation_url TEXT);
 CREATE TABLE IF NOT EXISTS help(msg_id INTEGER PRIMARY KEY, user_id INTEGER);
 CREATE TABLE IF NOT EXISTS support_links(
   chat_id INTEGER, message_id INTEGER, user_id INTEGER,
@@ -155,6 +162,16 @@ def fmt(d: datetime) -> str:
     return d.strftime("%d.%m.%Y")
 
 
+def autopay_status(row) -> str:
+    if not row or not row["method_id"]:
+        return "Автосписание не настроено: сохранённого способа оплаты нет."
+    if not AUTOCHARGE:
+        return "Способ оплаты сохранён, но автосписание выключено в настройках бота."
+    if row["autopay"]:
+        return "Автосписание включено."
+    return "Способ оплаты сохранён, автосписание отключено."
+
+
 def link_support_message(chat_id: int, message_id: int, user_id: int):
     db.execute(
         "INSERT OR REPLACE INTO support_links(chat_id, message_id, user_id) VALUES(?,?,?)",
@@ -207,28 +224,88 @@ async def safe_send(uid: int, text: str, kb=None):
 
 
 # ---------- ЮKassa ----------
-def _create_payment(user_id: int, method_id: str | None = None):
+def _create_payment(user_id: int, method_id: str | None = None,
+                    save_payment_method: bool | None = None,
+                    replace_method: bool = False):
+    if save_payment_method is None:
+        save_payment_method = AUTOCHARGE
     params = {
         "amount": {"value": f"{PRICE:.2f}", "currency": "RUB"},
         "capture": True,
         "description": "Ежемесячная подписка на закрытый канал с лекциями",
-        "metadata": {"user_id": str(user_id)},
+        "metadata": {"user_id": str(user_id), "replace_method": str(replace_method).lower()},
     }
     if method_id:  # автосписание с сохранённого способа оплаты
         params["payment_method_id"] = method_id
-    else:  # ← ЗДЕСЬ создаётся платёж; когда ЮKassa подключат, добавим чек/доп. параметры
+    else:
         params["confirmation"] = {"type": "redirect", "return_url": RETURN_URL}
-        params["save_payment_method"] = AUTOCHARGE
+        params["save_payment_method"] = save_payment_method
     return Payment.create(params, str(uuid.uuid4()))
 
 
-async def new_payment(user_id: int, method_id: str | None = None):
+async def new_payment(user_id: int, method_id: str | None = None,
+                      save_payment_method: bool | None = None, replace_method: bool = False):
     is_auto = method_id is not None
-    p = await asyncio.to_thread(_create_payment, user_id, method_id)
+    p = await asyncio.to_thread(
+        _create_payment, user_id, method_id, save_payment_method, replace_method
+    )
     db.execute("INSERT OR IGNORE INTO pending(id, user_id, created, is_auto) VALUES(?,?,?,?)",
                (p.id, user_id, iso(now()), int(is_auto)))
     db.commit()
     return p
+
+
+def _create_payment_method(user_id: int):
+    params = {
+        "type": "bank_card",
+        "confirmation": {"type": "redirect", "return_url": RETURN_URL},
+        "metadata": {"user_id": str(user_id)},
+    }
+    return PaymentMethod.create(params, str(uuid.uuid4()))
+
+
+async def new_payment_method(user_id: int):
+    pending = db.execute(
+        "SELECT confirmation_url FROM pending_methods WHERE user_id=? ORDER BY created DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if pending:
+        return pending["confirmation_url"]
+    method = await asyncio.to_thread(_create_payment_method, user_id)
+    confirmation_url = method.confirmation.confirmation_url
+    db.execute(
+        "INSERT INTO pending_methods(id,user_id,created,confirmation_url) VALUES(?,?,?,?)",
+        (method.id, user_id, iso(now()), confirmation_url),
+    )
+    db.commit()
+    return confirmation_url
+
+
+async def handle_payment_method(method_id: str):
+    method = await asyncio.to_thread(PaymentMethod.find_one, method_id)
+    pending = db.execute("SELECT user_id FROM pending_methods WHERE id=?", (method_id,)).fetchone()
+    if not pending:
+        return
+    uid = pending["user_id"]
+    if method.status == "active" and method.saved:
+        db.execute(
+            "UPDATE users SET method_id=?, last_charge=NULL WHERE user_id=?",
+            (method.id, uid),
+        )
+        db.execute("DELETE FROM pending_methods WHERE user_id=?", (uid,))
+        db.commit()
+        await safe_send(
+            uid,
+            "✅ Новый способ оплаты сохранён без списания средств. "
+            "Срок подписки не изменился. Посмотреть автосписание можно в /status.",
+        )
+    elif method.status == "inactive" or datetime.fromisoformat(pending["created"]) < now() - timedelta(days=2):
+        db.execute("DELETE FROM pending_methods WHERE id=?", (method_id,))
+        db.commit()
+        await safe_send(
+            uid,
+            "Не удалось привязать способ оплаты или ссылка устарела. Попробуйте снова через /status.",
+        )
 
 
 async def handle_payment(p):
@@ -251,10 +328,11 @@ async def handle_payment(p):
         f"Сумма: {amount} {currency}\nПлатёж: <code>{html.escape(str(p.id))}</code>",
     )
     method = p.payment_method.id if p.payment_method and getattr(p.payment_method, "saved", False) else None
-    await extend(uid, PERIOD_DAYS, method)
+    await extend(uid, PERIOD_DAYS, method, replace_method=bool(p.metadata.get("replace_method")))
 
 
-async def extend(uid: int, days: float, method_id: str | None = None):
+async def extend(uid: int, days: float, method_id: str | None = None,
+                 replace_method: bool = False):
     row = db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
     base, was_active = now(), False
     if row and row["expires_at"] and row["active"]:
@@ -264,19 +342,27 @@ async def extend(uid: int, days: float, method_id: str | None = None):
     new_exp = base + timedelta(days=days)
     db.execute("""INSERT INTO users(user_id, expires_at, active, method_id) VALUES(?,?,1,?)
                   ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at, active=1,
-                  method_id=COALESCE(excluded.method_id, method_id),
-                  pay_started_at=NULL, stuck_reminded=0""", (uid, iso(new_exp), method_id))
+                  method_id=CASE WHEN ? THEN excluded.method_id
+                                 ELSE COALESCE(excluded.method_id, users.method_id) END,
+                  autopay=CASE WHEN ? AND excluded.method_id IS NULL THEN 0 ELSE users.autopay END,
+                  pay_started_at=NULL, stuck_reminded=0""",
+               (uid, iso(new_exp), method_id, int(replace_method), int(replace_method)))
     db.commit()
+    status = autopay_status(
+        db.execute("SELECT autopay, method_id FROM users WHERE user_id=?", (uid,)).fetchone()
+    )
     if was_active:
-        await safe_send(uid, T_PAID_EXT.format(date=fmt(new_exp)))
+        await safe_send(uid, T_PAID_EXT.format(date=fmt(new_exp), autopay_status=status))
         return
     try:
         link = await bot.create_chat_invite_link(
             CHANNEL_ID, member_limit=1, expire_date=int(time.time()) + 86400)
-        await safe_send(uid, T_PAID_NEW.format(date=fmt(new_exp), link=link.invite_link))
+        await safe_send(uid, T_PAID_NEW.format(
+            date=fmt(new_exp), link=link.invite_link, autopay_status=status
+        ))
     except Exception:
         logging.exception("не удалось создать ссылку")
-        await safe_send(uid, T_PAID_NOLINK, KB_HELP)
+        await safe_send(uid, T_PAID_NOLINK.format(autopay_status=status), KB_HELP)
         await safe_send(ADMIN_ID, f"⚠️ Не удалось выдать ссылку пользователю <code>{uid}</code>. Бот — админ канала?")
 
 
@@ -322,16 +408,21 @@ async def set_subscription_days(uid: int, days: float):
         (iso(new_exp), uid),
     )
     db.commit()
+    status = autopay_status(
+        db.execute("SELECT autopay, method_id FROM users WHERE user_id=?", (uid,)).fetchone()
+    )
     if was_active:
-        await safe_send(uid, T_PAID_EXT.format(date=fmt(new_exp)))
+        await safe_send(uid, T_PAID_EXT.format(date=fmt(new_exp), autopay_status=status))
         return new_exp
     try:
         link = await bot.create_chat_invite_link(
             CHANNEL_ID, member_limit=1, expire_date=int(time.time()) + 86400)
-        await safe_send(uid, T_PAID_NEW.format(date=fmt(new_exp), link=link.invite_link))
+        await safe_send(uid, T_PAID_NEW.format(
+            date=fmt(new_exp), link=link.invite_link, autopay_status=status
+        ))
     except Exception:
         logging.exception("не удалось создать ссылку")
-        await safe_send(uid, T_PAID_NOLINK, KB_HELP)
+        await safe_send(uid, T_PAID_NOLINK.format(autopay_status=status), KB_HELP)
         await safe_send(ADMIN_ID, f"⚠️ Не удалось выдать ссылку пользователю <code>{uid}</code>. Бот — админ канала?")
     return new_exp
 
@@ -511,11 +602,115 @@ async def admin_reply(m: Message):
 @dp.message(Command("status"))
 async def status(m: Message):
     ensure_user(m.from_user.id, m.from_user.username)
-    u = active_subscription(m.from_user.id)
-    if u:
-        await m.answer(T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))), reply_markup=KB_HELP)
+    text, keyboard = subscription_status(m.from_user.id)
+    await m.answer(text, reply_markup=keyboard)
+
+
+def subscription_status(uid: int):
+    row = db.execute(
+        "SELECT expires_at, method_id, autopay FROM users WHERE user_id=?", (uid,)
+    ).fetchone()
+    if row and active_subscription(uid):
+        subscription = f"Подписка активна до <b>{fmt(datetime.fromisoformat(row['expires_at']))}</b>."
     else:
-        await m.answer(T_STATUS_NO, reply_markup=KB_START)
+        subscription = "Активной подписки нет."
+    has_method = bool(row and row["method_id"])
+    if not AUTOCHARGE:
+        auto_status = "Автосписание недоступно: его нужно включить в настройках бота."
+    elif row and row["autopay"] and has_method:
+        auto_status = "Автосписание: <b>включено</b>."
+    elif has_method:
+        auto_status = "Автосписание: <b>отключено</b>. Способ оплаты сохранён."
+    else:
+        auto_status = "Автосписание: <b>не настроено</b>. Сначала обновите способ оплаты."
+    text = f"{subscription}\n{auto_status}"
+    keyboard = markup(
+        [btn("🔕 Отключить автосписание", "status:disable")],
+        [btn("🔔 Включить автосписание", "status:enable")],
+        [btn("💳 Изменить способ оплаты", "status:change_method")],
+        [btn("💬 Связаться с нами", "help")],
+    )
+    return text, keyboard
+
+
+@dp.callback_query(F.data.startswith("status:"))
+async def status_action(cb: CallbackQuery):
+    uid = cb.from_user.id
+    row = db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    action = cb.data.split(":", 1)[1]
+    if action == "disable":
+        if row:
+            db.execute("UPDATE users SET autopay=0 WHERE user_id=?", (uid,))
+            db.commit()
+        await cb.answer("Автосписание отключено.")
+    elif action == "enable":
+        if not AUTOCHARGE:
+            await cb.answer("Автосписание пока не включено в настройках бота.", show_alert=True)
+            return
+        if not active_subscription(uid):
+            await cb.answer("Автосписание можно включить при активной подписке.", show_alert=True)
+            return
+        if not row or not row["method_id"]:
+            await cb.answer("Сначала нажмите «Изменить способ оплаты».", show_alert=True)
+            return
+        db.execute("UPDATE users SET autopay=1, last_charge=NULL WHERE user_id=?", (uid,))
+        db.commit()
+        await cb.answer("Автосписание включено.")
+    elif action == "change_method":
+        await cb.message.answer(
+            "Как вы хотите изменить способ оплаты?",
+            reply_markup=markup(
+                [btn("Изменить и оплатить продление", "status:change_paid")],
+                [btn("Только привязать карту без списания", "status:change_free")],
+            ),
+        )
+        await cb.answer()
+        return
+    elif action == "change_paid":
+        if TEST_MODE:
+            await cb.answer("Платежи ЮKassa сейчас не настроены.", show_alert=True)
+            return
+        try:
+            payment = await new_payment(uid, save_payment_method=True, replace_method=True)
+        except Exception:
+            logging.exception("не удалось создать платёж для смены способа оплаты: %s", uid)
+            await cb.answer("Не удалось создать платёж. Попробуйте позже или свяжитесь с нами.", show_alert=True)
+            return
+        await cb.message.answer(
+            "Чтобы заменить сохранённый способ оплаты, оплатите продление по ссылке. "
+            f"К текущему сроку подписки добавится {PERIOD_DAYS:g} дней.",
+            reply_markup=markup(
+                [InlineKeyboardButton(text="Перейти к оплате", url=payment.confirmation.confirmation_url)],
+                [btn("💬 Связаться с нами", "help")],
+            ),
+        )
+        await cb.answer()
+        return
+    elif action == "change_free":
+        if TEST_MODE:
+            await cb.answer("Платежи ЮKassa сейчас не настроены.", show_alert=True)
+            return
+        try:
+            confirmation_url = await new_payment_method(uid)
+        except Exception:
+            logging.exception("не удалось создать привязку способа оплаты: %s", uid)
+            await cb.answer("Не удалось создать привязку. Попробуйте позже или свяжитесь с нами.", show_alert=True)
+            return
+        await cb.message.answer(
+            "Откройте форму ЮKassa и подтвердите привязку карты. Списания при привязке не будет, "
+            "срок подписки не изменится. После подтверждения можно включить автосписание в /status.",
+            reply_markup=markup(
+                [InlineKeyboardButton(text="Привязать карту", url=confirmation_url)],
+                [btn("💬 Связаться с нами", "help")],
+            ),
+        )
+        await cb.answer()
+        return
+    else:
+        await cb.answer("Неизвестное действие.", show_alert=True)
+        return
+    text, keyboard = subscription_status(uid)
+    await cb.message.edit_text(text, reply_markup=keyboard)
 
 
 @dp.message(Command("cancel"))
@@ -538,7 +733,7 @@ def users_page(page: int):
     pages = max(1, (count + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     rows = db.execute(
-        "SELECT user_id, username, expires_at, active, blocked FROM users "
+        "SELECT user_id, username, expires_at, active, blocked, autopay, method_id FROM users "
         "ORDER BY user_id DESC LIMIT ? OFFSET ?",
         (USERS_PAGE_SIZE, page * USERS_PAGE_SIZE),
     ).fetchall()
@@ -555,6 +750,7 @@ def users_page(page: int):
             subscription = "подписки нет"
         if row["blocked"]:
             subscription += "; заблокирован"
+        subscription += f"; {autopay_status(row)}"
         lines.append(f"• {username}<code>{uid}</code> — {subscription}")
         label = f"@{row['username']}" if row["username"] else str(uid)
         keyboard_rows.append([btn(label[:40], f"users:view:{uid}:{page}")])
@@ -571,7 +767,8 @@ def users_page(page: int):
 
 def user_details(uid: int, page: int):
     row = db.execute(
-        "SELECT user_id, username, expires_at, active, blocked FROM users WHERE user_id=?",
+        "SELECT user_id, username, expires_at, active, blocked, autopay, method_id "
+        "FROM users WHERE user_id=?",
         (uid,),
     ).fetchone()
     if not row:
@@ -585,6 +782,7 @@ def user_details(uid: int, page: int):
         subscription = "Подписки нет"
     if row["blocked"]:
         subscription += "\nСтатус бота: заблокирован"
+    subscription += f"\n{autopay_status(row)}"
     text = f"<b>Пользователь</b>\nID: <code>{uid}</code>\nUsername: {username}\nПодписка: {subscription}"
     keyboard = markup(
         [btn("➕ Продлить на 30 дней", f"users:extend30:{uid}:{page}")],
@@ -871,6 +1069,15 @@ async def check_pending():
                 await safe_send(r["user_id"], T_AUTO_FAIL, KB_RENEW)
 
 
+async def check_pending_methods():
+    pending = db.execute("SELECT id FROM pending_methods").fetchall()
+    for row in pending:
+        try:
+            await handle_payment_method(row["id"])
+        except Exception:
+            logging.exception("не удалось проверить сохранение способа оплаты %s", row["id"])
+
+
 async def check_stuck():
     """Дошёл до оплаты, но через STUCK_HOURS так и не оплатил: один раз напоминаем."""
     limit = iso(now() - timedelta(hours=STUCK_HOURS))
@@ -944,6 +1151,7 @@ async def scheduler():
             await check_daily_report()
             if not TEST_MODE:
                 await check_pending()
+                await check_pending_methods()
             await check_stuck()
             await check_backup()
             await check_subscriptions()
@@ -959,6 +1167,8 @@ async def yk_hook(request: web.Request):
         if data.get("event") == "payment.succeeded":
             p = await asyncio.to_thread(Payment.find_one, data["object"]["id"])  # перепроверяем у ЮKassa
             await handle_payment(p)
+        elif data.get("event") == "payment_method.active":
+            await handle_payment_method(data["object"]["id"])
     except Exception:
         logging.exception("ошибка вебхука")
     return web.Response(text="ok")
