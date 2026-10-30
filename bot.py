@@ -92,6 +92,9 @@ CREATE TABLE IF NOT EXISTS users(
 CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT);
 CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY, user_id INTEGER, created TEXT);
 CREATE TABLE IF NOT EXISTS help(msg_id INTEGER PRIMARY KEY, user_id INTEGER);
+CREATE TABLE IF NOT EXISTS support_links(
+  chat_id INTEGER, message_id INTEGER, user_id INTEGER,
+  PRIMARY KEY(chat_id, message_id));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
 
@@ -112,6 +115,7 @@ logging.info("База данных: %s", os.path.abspath(DB_PATH))
 
 awaiting_help: set[int] = set()  # кто сейчас пишет вопрос администратору
 awaiting_custom_days: dict[int, tuple[int, int, int, int]] = {}  # user_id, страница, панель, запрос срока
+awaiting_compose: dict[int, tuple[int, int, int]] = {}  # user_id, страница, сообщение-запрос
 
 
 def now() -> datetime:
@@ -124,6 +128,22 @@ def iso(d: datetime) -> str:
 
 def fmt(d: datetime) -> str:
     return d.strftime("%d.%m.%Y")
+
+
+def link_support_message(chat_id: int, message_id: int, user_id: int):
+    db.execute(
+        "INSERT OR REPLACE INTO support_links(chat_id, message_id, user_id) VALUES(?,?,?)",
+        (chat_id, message_id, user_id),
+    )
+    db.commit()
+
+
+def support_user(chat_id: int, message_id: int):
+    row = db.execute(
+        "SELECT user_id FROM support_links WHERE chat_id=? AND message_id=?",
+        (chat_id, message_id),
+    ).fetchone()
+    return row["user_id"] if row else None
 
 
 def active_subscription(uid: int):
@@ -259,6 +279,35 @@ async def reset_subscription(uid: int) -> bool:
     return removed
 
 
+async def set_subscription_days(uid: int, days: float):
+    row = db.execute("SELECT active, expires_at FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not row:
+        raise ValueError("Пользователь не найден.")
+    was_active = bool(
+        row["active"] and row["expires_at"]
+        and datetime.fromisoformat(row["expires_at"]) > now()
+    )
+    new_exp = now() + timedelta(days=days)
+    db.execute(
+        "UPDATE users SET expires_at=?, active=1, last_remind=NULL, last_charge=NULL, "
+        "pay_started_at=NULL, stuck_reminded=0 WHERE user_id=?",
+        (iso(new_exp), uid),
+    )
+    db.commit()
+    if was_active:
+        await safe_send(uid, T_PAID_EXT.format(date=fmt(new_exp)))
+        return new_exp
+    try:
+        link = await bot.create_chat_invite_link(
+            CHANNEL_ID, member_limit=1, expire_date=int(time.time()) + 86400)
+        await safe_send(uid, T_PAID_NEW.format(date=fmt(new_exp), link=link.invite_link))
+    except Exception:
+        logging.exception("не удалось создать ссылку")
+        await safe_send(uid, T_PAID_NOLINK, KB_HELP)
+        await safe_send(ADMIN_ID, f"⚠️ Не удалось выдать ссылку пользователю <code>{uid}</code>. Бот — админ канала?")
+    return new_exp
+
+
 # ---------- Воронка: /start -> оплата ----------
 @dp.message(Command("start", "join"))
 async def start(m: Message):
@@ -383,10 +432,45 @@ async def restore_cmd(m: Message):
 
 @dp.message(F.from_user.id == ADMIN_ID, F.reply_to_message)
 async def admin_reply(m: Message):
-    """Ответ админа реплаем на пересланный вопрос уходит автору вопроса."""
     reply = m.reply_to_message
+    pending_custom = awaiting_custom_days.get(ADMIN_ID)
+    if pending_custom and reply.message_id == pending_custom[3]:
+        target_uid, page, panel_message_id, _ = pending_custom
+        try:
+            days = float(m.text or "")
+            if not math.isfinite(days) or days <= 0:
+                raise ValueError
+        except ValueError:
+            await m.answer("Ответьте на запрос положительным числом дней или используйте /cancel.")
+            return
+        try:
+            new_exp = await set_subscription_days(target_uid, days)
+        except OverflowError:
+            await m.answer("Слишком большой срок. Введите меньшее число дней.")
+            return
+        awaiting_custom_days.pop(ADMIN_ID, None)
+        text, keyboard = user_details(target_uid, page)
+        await bot.edit_message_text(text, chat_id=ADMIN_ID, message_id=panel_message_id,
+                                    reply_markup=keyboard)
+        await m.answer(f"Подписка установлена до {fmt(new_exp)}.")
+        return
+
+    pending_compose = awaiting_compose.get(ADMIN_ID)
+    if pending_compose and reply.message_id == pending_compose[2]:
+        target_uid, _, _ = pending_compose
+        try:
+            sent = await m.copy_to(target_uid)
+        except Exception:
+            logging.exception("не удалось отправить сообщение пользователю %s", target_uid)
+            await m.answer("Не удалось отправить сообщение: пользователь мог заблокировать бота.")
+            return
+        link_support_message(target_uid, sent.message_id, target_uid)
+        awaiting_compose.pop(ADMIN_ID, None)
+        await m.answer("✅ Сообщение отправлено. Ответ пользователя придёт сюда; отвечайте на него реплаем.")
+        return
+
     row = db.execute("SELECT user_id FROM help WHERE msg_id=?", (reply.message_id,)).fetchone()
-    uid = row["user_id"] if row else None
+    uid = row["user_id"] if row else support_user(ADMIN_ID, reply.message_id)
     if uid is None and reply.from_user and reply.from_user.is_bot:
         text = reply.text or reply.caption or ""
         first_line = text.splitlines()[0] if text else ""
@@ -398,9 +482,11 @@ async def admin_reply(m: Message):
         await m.answer("Не нашёл, кому отвечать. Отвечайте реплаем именно на сообщение с вопросом.")
         return
     try:
-        await m.copy_to(uid)
-        await m.answer("✅ Отправлено.")
+        sent = await m.copy_to(uid)
+        link_support_message(uid, sent.message_id, uid)
+        await m.answer("✅ Отправлено. Пользователь сможет ответить реплаем на это сообщение.")
     except Exception:
+        logging.exception("не удалось отправить ответ пользователю %s", uid)
         await m.answer("Не удалось отправить: пользователь мог заблокировать бота.")
 
 
@@ -417,9 +503,12 @@ async def status(m: Message):
 
 @dp.message(Command("cancel"))
 async def cancel(m: Message):
-    if m.from_user.id == ADMIN_ID and ADMIN_ID in awaiting_custom_days:
-        awaiting_custom_days.pop(ADMIN_ID)
-        await m.answer("Изменение срока отменено.")
+    if m.from_user.id == ADMIN_ID and (
+        ADMIN_ID in awaiting_custom_days or ADMIN_ID in awaiting_compose
+    ):
+        awaiting_custom_days.pop(ADMIN_ID, None)
+        awaiting_compose.pop(ADMIN_ID, None)
+        await m.answer("Действие отменено.")
         return
     ensure_user(m.from_user.id, m.from_user.username)
     db.execute("UPDATE users SET autopay=0 WHERE user_id=?", (m.from_user.id,))
@@ -480,6 +569,7 @@ def user_details(uid: int, page: int):
         [btn("➕ Продлить на 30 дней", f"users:extend30:{uid}:{page}")],
         [btn("📅 Продлить на срок", f"users:custom:{uid}:{page}")],
         [btn("🗑 Сбросить и удалить из канала", f"users:reset:{uid}:{page}")],
+        [btn("✉️ Написать пользователю", f"users:message:{uid}:{page}")],
         [btn("⬅️ К списку", f"users:page:{page}")],
     )
     return text, keyboard
@@ -527,6 +617,16 @@ async def users_action(cb: CallbackQuery):
                 "(например, <code>45</code>)."
             )
             awaiting_custom_days[ADMIN_ID] = (uid, page, cb.message.message_id, prompt.message_id)
+        elif action == "message":
+            uid, page = int(parts[2]), int(parts[3])
+            if not db.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
+                await cb.answer("Пользователь не найден.", show_alert=True)
+                return
+            prompt = await cb.message.answer(
+                f"Ответьте на это сообщение текстом или медиа для пользователя "
+                f"<code>{uid}</code> — оно будет отправлено ему."
+            )
+            awaiting_compose[ADMIN_ID] = (uid, page, prompt.message_id)
         elif action == "reset":
             uid, page = int(parts[2]), int(parts[3])
             if not db.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
@@ -601,33 +701,22 @@ async def stats(m: Message):
 async def any_message(m: Message):
     """Всё остальное: либо вопрос администратору (после /help), либо подсказка."""
     uid = m.from_user.id
-    pending_custom = awaiting_custom_days.get(uid) if uid == ADMIN_ID else None
-    if pending_custom and m.reply_to_message and m.reply_to_message.message_id == pending_custom[3]:
-        target_uid, page, panel_message_id, _ = pending_custom
-        try:
-            days = float(m.text or "")
-            if not math.isfinite(days) or days <= 0:
-                raise ValueError
-        except ValueError:
-            await m.answer("Введите положительное число дней или /cancel для отмены.")
-            return
-        if not db.execute("SELECT 1 FROM users WHERE user_id=?", (target_uid,)).fetchone():
-            awaiting_custom_days.pop(uid, None)
-            await m.answer("Пользователь не найден в базе.")
-            return
-        try:
-            await extend(target_uid, days)
-        except OverflowError:
-            await m.answer("Слишком большой срок. Введите меньшее число дней.")
-            return
-        awaiting_custom_days.pop(uid, None)
-        text, keyboard = user_details(target_uid, page)
-        await bot.edit_message_text(text, chat_id=ADMIN_ID, message_id=panel_message_id,
-                                    reply_markup=keyboard)
-        expiry = db.execute("SELECT expires_at FROM users WHERE user_id=?", (target_uid,)).fetchone()
-        await m.answer(f"Подписка продлена до {fmt(datetime.fromisoformat(expiry['expires_at']))}.")
-        return
     ensure_user(uid, m.from_user.username)
+    if uid != ADMIN_ID and m.reply_to_message:
+        target_uid = support_user(uid, m.reply_to_message.message_id)
+        if target_uid == uid:
+            who = html.escape(m.from_user.full_name)
+            username = f" (@{html.escape(m.from_user.username)})" if m.from_user.username else ""
+            header = await bot.send_message(
+                ADMIN_ID,
+                f"💬 Ответ от {who}{username}, id <code>{uid}</code>.\n"
+                "Ответьте реплаем на это сообщение или на пересланное сообщение пользователя.",
+            )
+            link_support_message(ADMIN_ID, header.message_id, uid)
+            forwarded = await m.copy_to(ADMIN_ID)
+            link_support_message(ADMIN_ID, forwarded.message_id, uid)
+            await m.answer("Ваш ответ передан. Мы ответим вам сюда.")
+            return
     if uid in awaiting_help:
         awaiting_help.discard(uid)
         who = html.escape(m.from_user.full_name) + (f" (@{m.from_user.username})" if m.from_user.username else "")
