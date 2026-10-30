@@ -7,6 +7,7 @@
 import asyncio
 import html
 import logging
+import math
 import os
 import sqlite3
 import tempfile
@@ -19,7 +20,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (BotCommand, CallbackQuery, FSInputFile, InlineKeyboardButton,
-                           InlineKeyboardMarkup, Message)
+                           BotCommandScopeChat, InlineKeyboardMarkup, Message)
 from aiohttp import web
 from dotenv import load_dotenv
 from yookassa import Configuration, Payment
@@ -110,6 +111,7 @@ migrate()
 logging.info("База данных: %s", os.path.abspath(DB_PATH))
 
 awaiting_help: set[int] = set()  # кто сейчас пишет вопрос администратору
+awaiting_custom_days: dict[int, tuple[int, int, int, int]] = {}  # user_id, страница, панель, запрос срока
 
 
 def now() -> datetime:
@@ -142,6 +144,7 @@ KB_RENEW = markup([btn("💳 Продлить подписку", "buy")])
 KB_PAY = lambda: markup([btn(f"💳 Оплатить {PRICE:.0f} ₽", "pay")], [btn("💬 Связаться", "help")])
 KB_STUCK = markup([btn("💬 Связаться", "help")], [btn("💳 Оплатить", "buy")])
 KB_HELP = markup([btn("💬 Связаться", "help")])
+USERS_PAGE_SIZE = 8
 
 
 def ensure_user(uid: int, username: str | None):
@@ -241,6 +244,18 @@ async def expire(uid: int) -> bool:
     db.execute("UPDATE users SET active=0 WHERE user_id=?", (uid,))
     db.commit()
     await safe_send(uid, T_EXPIRED, KB_RENEW)
+    return removed
+
+
+async def reset_subscription(uid: int) -> bool:
+    removed = await expire(uid)
+    db.execute(
+        "UPDATE users SET active=0, expires_at=NULL, method_id=NULL, "
+        "last_remind=NULL, last_charge=NULL, pay_started_at=NULL, stuck_reminded=0 "
+        "WHERE user_id=?",
+        (uid,),
+    )
+    db.commit()
     return removed
 
 
@@ -402,10 +417,133 @@ async def status(m: Message):
 
 @dp.message(Command("cancel"))
 async def cancel(m: Message):
+    if m.from_user.id == ADMIN_ID and ADMIN_ID in awaiting_custom_days:
+        awaiting_custom_days.pop(ADMIN_ID)
+        await m.answer("Изменение срока отменено.")
+        return
     ensure_user(m.from_user.id, m.from_user.username)
     db.execute("UPDATE users SET autopay=0 WHERE user_id=?", (m.from_user.id,))
     db.commit()
     await m.answer(T_CANCEL)
+
+
+def users_page(page: int):
+    count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    pages = max(1, (count + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    rows = db.execute(
+        "SELECT user_id, username, expires_at, active FROM users "
+        "ORDER BY user_id DESC LIMIT ? OFFSET ?",
+        (USERS_PAGE_SIZE, page * USERS_PAGE_SIZE),
+    ).fetchall()
+    lines = [f"<b>Пользователи</b> — всего: {count} (страница {page + 1}/{pages})"]
+    keyboard_rows = []
+    for row in rows:
+        uid = row["user_id"]
+        username = f"@{html.escape(row['username'])} " if row["username"] else ""
+        if active_subscription(uid):
+            subscription = f"активна до {fmt(datetime.fromisoformat(row['expires_at']))}"
+        elif row["expires_at"]:
+            subscription = f"неактивна (срок был до {fmt(datetime.fromisoformat(row['expires_at']))})"
+        else:
+            subscription = "подписки нет"
+        lines.append(f"• {username}<code>{uid}</code> — {subscription}")
+        label = f"@{row['username']}" if row["username"] else str(uid)
+        keyboard_rows.append([btn(label[:40], f"users:view:{uid}:{page}")])
+    navigation = []
+    if page > 0:
+        navigation.append(btn("⬅️ Назад", f"users:page:{page - 1}"))
+    if page + 1 < pages:
+        navigation.append(btn("Далее ➡️", f"users:page:{page + 1}"))
+    if navigation:
+        keyboard_rows.append(navigation)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None
+    return "\n".join(lines), keyboard, page
+
+
+def user_details(uid: int, page: int):
+    row = db.execute(
+        "SELECT user_id, username, expires_at, active FROM users WHERE user_id=?",
+        (uid,),
+    ).fetchone()
+    if not row:
+        return "Пользователь не найден в базе.", markup([btn("⬅️ К списку", f"users:page:{page}")])
+    username = f"@{html.escape(row['username'])}" if row["username"] else "не указан"
+    if active_subscription(uid):
+        subscription = f"Активна до {fmt(datetime.fromisoformat(row['expires_at']))}"
+    elif row["expires_at"]:
+        subscription = f"Неактивна (срок был до {fmt(datetime.fromisoformat(row['expires_at']))})"
+    else:
+        subscription = "Подписки нет"
+    text = f"<b>Пользователь</b>\nID: <code>{uid}</code>\nUsername: {username}\nПодписка: {subscription}"
+    keyboard = markup(
+        [btn("➕ Продлить на 30 дней", f"users:extend30:{uid}:{page}")],
+        [btn("📅 Продлить на срок", f"users:custom:{uid}:{page}")],
+        [btn("🗑 Сбросить и удалить из канала", f"users:reset:{uid}:{page}")],
+        [btn("⬅️ К списку", f"users:page:{page}")],
+    )
+    return text, keyboard
+
+
+@dp.message(Command("users"))
+async def users_cmd(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        await m.answer("Эта команда доступна только администратору.")
+        return
+    text, keyboard, _ = users_page(0)
+    await m.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith("users:"))
+async def users_action(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID:
+        await cb.answer("Команда доступна только администратору.", show_alert=True)
+        return
+    parts = cb.data.split(":")
+    try:
+        action = parts[1]
+        if action == "page":
+            text, keyboard, _ = users_page(int(parts[2]))
+            await cb.message.edit_text(text, reply_markup=keyboard)
+        elif action == "view":
+            uid, page = int(parts[2]), int(parts[3])
+            text, keyboard = user_details(uid, page)
+            await cb.message.edit_text(text, reply_markup=keyboard)
+        elif action == "extend30":
+            uid, page = int(parts[2]), int(parts[3])
+            if not db.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
+                await cb.answer("Пользователь не найден.", show_alert=True)
+                return
+            await extend(uid, 30)
+            text, keyboard = user_details(uid, page)
+            await cb.message.edit_text(text, reply_markup=keyboard)
+        elif action == "custom":
+            uid, page = int(parts[2]), int(parts[3])
+            if not db.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
+                await cb.answer("Пользователь не найден.", show_alert=True)
+                return
+            prompt = await cb.message.answer(
+                f"Ответьте на это сообщение числом дней для пользователя <code>{uid}</code> "
+                "(например, <code>45</code>)."
+            )
+            awaiting_custom_days[ADMIN_ID] = (uid, page, cb.message.message_id, prompt.message_id)
+        elif action == "reset":
+            uid, page = int(parts[2]), int(parts[3])
+            if not db.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
+                await cb.answer("Пользователь не найден.", show_alert=True)
+                return
+            removed = await reset_subscription(uid)
+            text, keyboard = user_details(uid, page)
+            await cb.message.edit_text(text, reply_markup=keyboard)
+            await cb.answer("Подписка сброшена." if removed else "Подписка сброшена; удаление из канала не удалось.")
+            return
+        else:
+            await cb.answer("Неизвестное действие.", show_alert=True)
+            return
+    except (IndexError, ValueError):
+        await cb.answer("Не удалось обработать действие.", show_alert=True)
+        return
+    await cb.answer()
 
 
 @dp.message(Command("grant"))
@@ -439,13 +577,7 @@ async def delete_subscription(m: Message):
         return
 
     uid = row["user_id"]
-    removed = await expire(uid)
-    db.execute(
-        "UPDATE users SET active=0, expires_at=NULL, method_id=NULL, "
-        "last_remind=NULL, last_charge=NULL WHERE user_id=?",
-        (uid,),
-    )
-    db.commit()
+    removed = await reset_subscription(uid)
     if removed:
         await m.answer(f"Подписка пользователя <code>{uid}</code> сброшена, доступ в канал удалён.")
     else:
@@ -469,6 +601,32 @@ async def stats(m: Message):
 async def any_message(m: Message):
     """Всё остальное: либо вопрос администратору (после /help), либо подсказка."""
     uid = m.from_user.id
+    pending_custom = awaiting_custom_days.get(uid) if uid == ADMIN_ID else None
+    if pending_custom and m.reply_to_message and m.reply_to_message.message_id == pending_custom[3]:
+        target_uid, page, panel_message_id, _ = pending_custom
+        try:
+            days = float(m.text or "")
+            if not math.isfinite(days) or days <= 0:
+                raise ValueError
+        except ValueError:
+            await m.answer("Введите положительное число дней или /cancel для отмены.")
+            return
+        if not db.execute("SELECT 1 FROM users WHERE user_id=?", (target_uid,)).fetchone():
+            awaiting_custom_days.pop(uid, None)
+            await m.answer("Пользователь не найден в базе.")
+            return
+        try:
+            await extend(target_uid, days)
+        except OverflowError:
+            await m.answer("Слишком большой срок. Введите меньшее число дней.")
+            return
+        awaiting_custom_days.pop(uid, None)
+        text, keyboard = user_details(target_uid, page)
+        await bot.edit_message_text(text, chat_id=ADMIN_ID, message_id=panel_message_id,
+                                    reply_markup=keyboard)
+        expiry = db.execute("SELECT expires_at FROM users WHERE user_id=?", (target_uid,)).fetchone()
+        await m.answer(f"Подписка продлена до {fmt(datetime.fromisoformat(expiry['expires_at']))}.")
+        return
     ensure_user(uid, m.from_user.username)
     if uid in awaiting_help:
         awaiting_help.discard(uid)
@@ -594,6 +752,17 @@ async def main():
         BotCommand(command="help", description="Связаться с нами"),
         BotCommand(command="cancel", description="Отключить автопродление"),
     ])
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Начать / оформить подписку"),
+        BotCommand(command="status", description="Статус подписки"),
+        BotCommand(command="help", description="Связаться с нами"),
+        BotCommand(command="cancel", description="Отключить автопродление"),
+        BotCommand(command="users", description="Управление пользователями"),
+        BotCommand(command="grant", description="Выдать подписку"),
+        BotCommand(command="del", description="Сбросить подписку"),
+        BotCommand(command="stats", description="Статистика бота"),
+        BotCommand(command="backup", description="Копия базы данных"),
+    ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     if WEBHOOK_PORT:
         app = web.Application()
         app.router.add_post("/yookassa", yk_hook)
