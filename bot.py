@@ -47,6 +47,7 @@ RETURN_URL = os.getenv("RETURN_URL", "https://t.me/")
 DATA_DIR = os.getenv("DATA_DIR") or ("/app/data" if os.path.isdir("/app/data") else ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "bot.db")
+PAYMENT_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Inter.png")
 BACKUP_HOURS = float(os.getenv("BACKUP_HOURS", "24"))  # как часто бот присылает вам копию базы
 # ============================== TEXTS ==============================
 # Разметка: <b>жирный</b>, <i>курсив</i>. Подстановки в {фигурных скобках} не трогайте.
@@ -55,6 +56,13 @@ T_WELCOME = ("Привет, я бот Круга Ильи Хабирова. Я �
 T_PRODUCT = ("📚 <b>Ежемесячная подписка на закрытый канал с лекциями</b>\n"
              "Цена: <b>{price} ₽</b> в месяц\n\n"
              "Перед оплатой ознакомьтесь с {offer}.")
+T_WHAT_YOU_GET = (
+    "Приобретая подписку в «Круге», вы получаете доступ к ежемесячно обновляемому "
+    "Telegram-каналу с лекциями и статьями о духовном и личностном развитии. "
+    "Примеры статей можно посмотреть в нашем бесплатном канале @habirov_cyrcle.\n\n"
+    "В платной подписке, помимо статей, доступны видеолекции — обычно длительностью "
+    "час и более — на те же темы, но с более глубоким погружением вместе с автором."
+)
 T_AUTO_NOTE = "\n\nОплачивая, вы соглашаетесь на ежемесячное автопродление. Отключить: /cancel"
 T_OFFER_LINK = '<a href="{url}">публичной офертой</a>'
 T_OFFER_SOON = "публичной офертой (ссылка скоро появится)"
@@ -321,6 +329,11 @@ def markup(*rows) -> InlineKeyboardMarkup:
 KB_START = markup([btn("💳 Оплатить", "buy")])
 KB_RENEW = markup([btn("💳 Продлить подписку", "buy")])
 KB_PAY = lambda: markup([btn(f"💳 Оплатить {PRICE:.0f} ₽", "pay")], [btn("💬 Связаться", "help")])
+KB_PRODUCT = lambda: markup(
+    [btn(f"💳 Оплатить {PRICE:.0f} ₽", "pay")],
+    [btn("❓ Я не понимаю, что получу", "payment:details")],
+    [btn("💬 Связаться", "help")],
+)
 KB_STUCK = markup([btn("💬 Связаться", "help")], [btn("💳 Оплатить", "buy")])
 KB_HELP = markup([btn("💬 Связаться", "help")])
 USERS_PAGE_SIZE = 8
@@ -604,7 +617,24 @@ async def buy(cb: CallbackQuery):
     db.commit()
     offer = T_OFFER_LINK.format(url=html.escape(OFFER_URL, quote=True)) if OFFER_URL else T_OFFER_SOON
     text = T_PRODUCT.format(price=f"{PRICE:.0f}", offer=offer) + (T_AUTO_NOTE if AUTOCHARGE else "")
-    await cb.message.answer(text, reply_markup=KB_PAY())
+    if os.path.isfile(PAYMENT_IMAGE_PATH):
+        await cb.message.answer_photo(
+            FSInputFile(PAYMENT_IMAGE_PATH), caption=text, reply_markup=KB_PRODUCT()
+        )
+    else:
+        logging.error("Изображение оплаты не найдено: %s", PAYMENT_IMAGE_PATH)
+        await safe_send(ADMIN_ID, f"⚠️ Не найден файл картинки оплаты: <code>{html.escape(PAYMENT_IMAGE_PATH)}</code>")
+        await cb.message.answer(text, reply_markup=KB_PRODUCT())
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "payment:details")
+async def payment_details(cb: CallbackQuery):
+    if maintenance_enabled() and cb.from_user.id != ADMIN_ID:
+        await cb.message.answer(maintenance_message(), reply_markup=maintenance_keyboard())
+        await cb.answer()
+        return
+    await cb.message.answer(T_WHAT_YOU_GET, reply_markup=KB_PAY())
     await cb.answer()
 
 
