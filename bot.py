@@ -4,9 +4,9 @@
 -> напоминания -> (автосписание) -> закрытие доступа. /help — связь с владельцем.
 Все тексты бота лежат в блоке TEXTS ниже: правьте формулировки там.
 
-Воронка из Instagram (в этом же файле, блок FUNNEL): ссылка t.me/бот?start=insta -> квалификация
--> урок под ответы -> через несколько минут/дней LLM пишет первой -> диалог -> кнопка оплаты.
-Обычный /start работает как раньше.
+Воронка из Instagram (в этом же файле, блок FUNNEL): ссылка t.me/бот?start=insta -> вопрос об аудитории
+-> урок -> видео «Что такое Круг» -> тест из 7 вопросов -> профиль приходит администратору
+с кнопкой «Написать ему». Обычный /start работает как раньше.
 """
 import asyncio
 import html
@@ -21,12 +21,10 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (BotCommand, CallbackQuery, FSInputFile, InlineKeyboardButton,
                            BotCommandScopeChat, InlineKeyboardMarkup, Message)
@@ -58,10 +56,6 @@ PAYMENT_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "I
 BACKUP_HOURS = float(os.getenv("BACKUP_HOURS", "24"))  # как часто бот присылает вам копию базы
 # --- воронка из Instagram ---
 FUNNEL_PREFIX = os.getenv("FUNNEL_PAYLOAD_PREFIX", "insta")        # ссылка вида t.me/бот?start=insta
-LLM_URL = os.getenv("LLM_URL", "http://localhost:11434").rstrip("/")  # адрес вашей LLM (формат Ollama API)
-LLM_MODEL = os.getenv("LLM_MODEL", "llama3.1")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")                         # если API закрыт ключом
-FOLLOWUP_DELAY_MIN = int(os.getenv("FOLLOWUP_DELAY_MIN", "4320"))  # для теста 2; 4320 = 3 дня
 # ============================== TEXTS ==============================
 # Разметка: <b>жирный</b>, <i>курсив</i>. Подстановки в {фигурных скобках} не трогайте.
 T_WELCOME = ("Привет, я бот Круга Ильи Хабирова. Я выдаю доступ к закрытому каналу с лекциями.\n"
@@ -137,11 +131,11 @@ CREATE TABLE IF NOT EXISTS support_links(
   PRIMARY KEY(chat_id, message_id));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS funnel_users(
-  user_id INTEGER PRIMARY KEY, source TEXT, answers TEXT DEFAULT '{}', step INTEGER DEFAULT 0,
-  done INTEGER DEFAULT 0, lesson TEXT, followup_at INTEGER, followup_sent INTEGER DEFAULT 0,
-  optout INTEGER DEFAULT 0, created INTEGER);
-CREATE TABLE IF NOT EXISTS funnel_messages(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, role TEXT, content TEXT, ts INTEGER);
+  user_id INTEGER PRIMARY KEY, source TEXT, answers TEXT DEFAULT '{}', stage TEXT DEFAULT 'group',
+  step INTEGER DEFAULT 0, tmp TEXT DEFAULT '[]', done INTEGER DEFAULT 0, created INTEGER);
+CREATE TABLE IF NOT EXISTS crm_topics(user_id INTEGER PRIMARY KEY, chat_id INTEGER, thread_id INTEGER);
+CREATE TABLE IF NOT EXISTS crm_messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, direction TEXT, text TEXT, ts INTEGER);
 """
 
 
@@ -165,6 +159,11 @@ def migrate():
     pending_method_cols = {r["name"] for r in db.execute("PRAGMA table_info(pending_methods)")}
     if "store_mode" not in pending_method_cols:
         db.execute("ALTER TABLE pending_methods ADD COLUMN store_mode TEXT")
+    funnel_cols = {r["name"] for r in db.execute("PRAGMA table_info(funnel_users)")}
+    if "stage" not in funnel_cols:
+        db.execute("ALTER TABLE funnel_users ADD COLUMN stage TEXT DEFAULT 'group'")
+    if "tmp" not in funnel_cols:
+        db.execute("ALTER TABLE funnel_users ADD COLUMN tmp TEXT DEFAULT '[]'")
     db.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('payment_store_mode',?)", (PAYMENT_STORE_MODE,))
     db.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('maintenance_mode','1')")
     db.execute(
@@ -516,6 +515,7 @@ async def extend(uid: int, days: float, method_id: str | None = None,
         if exp > base:
             base, was_active = exp, True
     new_exp = base + timedelta(days=days)
+    await crm_notify(uid, f"💳 Подписка {'продлена' if was_active else 'оформлена'}, активна до {fmt(new_exp)}.")
     db.execute("""INSERT INTO users(user_id, expires_at, active, method_id, method_mode) VALUES(?,?,1,?,?)
                   ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at, active=1,
                   method_id=CASE WHEN ? THEN excluded.method_id
@@ -705,123 +705,353 @@ async def help_btn(cb: CallbackQuery):
     await cb.answer()
 
 
-# ====================== FUNNEL: Instagram -> квалификация -> урок -> дожим LLM -> оплата ======================
-# Тексты воронки. Разметка HTML (<b>, <i>, <a href="...">) работает в приветствии, вопросах и уроках.
-FUNNEL_GREETING = ("Привет! Я подготовлю для вас урок под ваш запрос.\n"
-                   "Ответьте на 3 коротких вопроса, это займёт минуту.")
-
-FUNNEL_QUESTIONS = [
-    {"key": "goal", "text": "1/3. Что для вас сейчас важнее всего?",
-     "options": ["Понять себя", "Изменить привычки", "Выйти на новый доход", "Снять тревогу и стресс"]},
-    {"key": "level", "text": "2/3. Как давно вы занимаетесь саморазвитием?",
-     "options": ["Только начинаю", "Пробовал(а) разное", "Давно в теме"]},
-    {"key": "pain", "text": "3/3. Что мешает больше всего?",
-     "options": ["Не хватает дисциплины", "Не знаю, с чего начать", "Нет времени", "Сомнения в себе"]},
+# ====================== FUNNEL: Instagram -> группа -> урок -> видео -> тест -> профиль админу ======================
+# Тексты воронки. Разметка HTML (<b>, <i>, <a href="...">) работает в сообщениях бота.
+FUNNEL_GREETING = ("Привет! Я бот Круга Ильи Хабирова. "
+                   "Чтобы подобрать для вас подходящий материал, ответьте на один вопрос.")
+FUNNEL_GROUP_Q = "<b>Кто вы и что ищете?</b>"
+# (текст кнопки, описание для админа)
+FUNNEL_GROUPS = [
+    ("🧭 Ищу себя и своё предназначение",
+     "Ищет себя и своё предназначение, хочет развить глубину понимания своей личности"),
+    ("💪 Стать сильнее и реализовать потенциал",
+     "Хочет стать сильнее, целостнее и реализовать свой потенциал на 100%"),
+    ("🔬 Я психолог / исследую человека",
+     "Психолог или исследователь человека и его глубины"),
 ]
 
-# Урок под ответ на первый вопрос. Замените заглушки на свои ссылки.
-FUNNEL_LESSONS = {
-    "Понять себя": "Ваш урок: «Как услышать себя». Ссылка: https://example.com/lesson-self",
-    "Изменить привычки": "Ваш урок: «Перепрограммирование привычек». Ссылка: https://example.com/lesson-habits",
-    "Выйти на новый доход": "Ваш урок: «Деньги и установки». Ссылка: https://example.com/lesson-money",
-    "Снять тревогу и стресс": "Ваш урок: «Спокойствие за 10 минут». Ссылка: https://example.com/lesson-calm",
+# Единственный урок, который получают все. Замените на свой.
+FUNNEL_LESSON = "🎁 <b>Ваш первый урок</b>\nНазвание урока: https://example.com/lesson"
+
+# Видео «Что такое Круг»: ссылка (YouTube и т.п.) ИЛИ file_id видео из Telegram.
+# Как получить file_id: отправьте видео этому боту от своего аккаунта, он ответит file_id.
+FUNNEL_VIDEO = os.getenv("FUNNEL_VIDEO", "")
+# CRM-группа: закрытая группа с включёнными топиками (id вида -100...). Бот создаёт в ней тему на каждого лида.
+# 0 = не используется, профили и переписка приходят админу в личку.
+CRM_CHAT_ID = int(os.getenv("CRM_CHAT_ID", "0") or 0)
+FUNNEL_TOPIC_COLORS = {"cold": 7322096, "interested": 16766590, "ready": 9367192}  # синий, жёлтый, зелёный
+FUNNEL_VIDEO_TEXT = ("Посмотрите короткое видео о том, что такое Круг.\n\n"
+                     "А я подготовлю для вас уникальный подарок: лекцию из закрытого сообщества "
+                     "под вашу уникальную цель.")
+FUNNEL_TEST_INTRO = ("Отлично! Теперь пройдите, пожалуйста, наш короткий тест (7 вопросов), "
+                     "чтобы я мог подобрать для вас подходящую лекцию.")
+FUNNEL_THANKS = ("Спасибо за ваши ответы! 🙏\n"
+                 "Наш администратор лично подберёт для вас урок и пришлёт его сюда, в бот. Ожидайте.")
+
+# Рекомендации по сегментам (редактируйте под свои продукты)
+FUNNEL_SEGMENTS = {
+    "cold": ("❄️ Холодный", "знакомство с бесплатным контентом и бесплатным уроком",
+             "бесплатный канал @habirov_cyrcle и бесплатный урок"),
+    "interested": ("🙂 Заинтересованный", "подходящий курс или образовательная программа",
+                   "подписка «Круг» (закрытый канал с лекциями)"),
+    "ready": ("🔥 Готовый", "наиболее подходящий платный продукт",
+              "подписка «Круг»: предложить оплату в первую очередь"),
 }
-FUNNEL_DEFAULT_LESSON = "Ваш урок: https://example.com/lesson-default"
+# Рекомендуемое направление по ответу на 1-й вопрос теста (по порядку вариантов)
+FUNNEL_DIRECTIONS = [
+    "реализация потенциала, деньги и действия",
+    "уверенность в себе и самопроявление",
+    "дисциплина, привычки и внутренняя опора",
+    "отношения с людьми и повторяющиеся сценарии",
+    "эмоциональная устойчивость и ресурс",
+    "поиск предназначения и самоопределение",
+    "глубинное самопознание и внутреннее развитие",
+    "определить по свободному ответу",
+]
 
-# Описание продукта для LLM, чтобы она ничего не выдумывала.
-FUNNEL_PRODUCT = (
-    f"ежемесячная подписка ({PRICE:.0f} ₽ за {PERIOD_DAYS:g} дн.) на закрытый Telegram-канал «Круг» с лекциями "
-    "и статьями о духовном и личностном развитии. Канал обновляется каждый месяц. Помимо статей, в подписке "
-    "есть видеолекции (обычно час и более) на те же темы, но с более глубоким погружением вместе с автором. "
-    "Примеры статей есть в бесплатном канале @habirov_cyrcle.")
+# Тест. type: single (одна кнопка) | multi (несколько + «Готово») | text (только текстом).
+# free=True: можно ответить и своим сообщением вместо кнопки.
+FUNNEL_TEST = [
+    {"key": "q1", "type": "single", "free": True,
+     "title": "Главный запрос",
+     "text": "Если бы ты мог прямо сейчас изменить одну сферу своей жизни, чтобы почувствовать, "
+             "что действительно движешься вперёд, что бы ты выбрал?",
+     "options": ["Финансы и реализация", "Уверенность в себе", "Дисциплина и сила воли",
+                 "Отношения с людьми", "Эмоциональное состояние", "Поиск своего предназначения",
+                 "Самопознание и внутреннее развитие", "Другое"]},
+    {"key": "q2", "type": "single", "free": True,
+     "title": "Основная проблема",
+     "text": "А что сейчас больше всего мешает тебе получить желаемое?",
+     "options": ["Не хватает дисциплины и последовательности", "Не понимаю, чего действительно хочу",
+                 "Знаю, что нужно делать, но постоянно откладываю",
+                 "Боюсь проявляться и заявлять о себе",
+                 "Чувствую, что мой потенциал намного больше, чем мои результаты",
+                 "Не могу избавиться от повторяющихся сценариев",
+                 "Не хватает энергии и внутренней опоры", "Другое"]},
+    {"key": "q3", "type": "single", "free": False,
+     "title": "Продолжительность проблемы",
+     "text": "Как давно ты замечаешь за собой эту ситуацию?",
+     "options": ["Несколько недель", "Несколько месяцев", "Несколько лет",
+                 "Кажется, это повторяется всю мою жизнь"]},
+    {"key": "q4", "type": "multi", "free": False,
+     "title": "Предыдущий опыт",
+     "text": "Пробовал ли ты раньше что-нибудь делать, чтобы изменить эту ситуацию?\n"
+             "(Можно выбрать несколько, затем нажмите «Готово».)",
+     "options": ["Читал книги по психологии и саморазвитию", "Проходил курсы и тренинги",
+                 "Работал с психологом или наставником",
+                 "Пробовал самостоятельно внедрять привычки и практики",
+                 "Много изучал, но мало применял", "Практически ничего не пробовал"]},
+    {"key": "q5", "type": "text", "free": True,
+     "title": "Желаемый результат",
+     "text": "Представь, что через 3 месяца ты действительно проделал большую внутреннюю работу. "
+             "Что должно измениться в твоей жизни, чтобы ты сказал: «Это было одно из лучших "
+             "решений, которые я принял»?\n\nНапишите ответ сообщением 👇",
+     "options": []},
+    {"key": "q6", "type": "single", "free": False,
+     "title": "Мотивация",
+     "text": "Насколько для тебя сейчас важно изменить эту ситуацию?",
+     "options": ["Просто интересуюсь саморазвитием", "Было бы здорово что-то изменить",
+                 "Давно хочу изменений, но никак не могу начать",
+                 "Я действительно готов заниматься собой и действовать"]},
+    {"key": "q7", "type": "single", "free": False,
+     "title": "Предпочтительный формат",
+     "text": "Какой формат развития тебе ближе?",
+     "options": ["Самостоятельное обучение через приложение и практические задания",
+                 "Структурированная программа с уроками и упражнениями", "Сообщество единомышленников",
+                 "Работа с наставником и обратная связь",
+                 "Комплексный подход: обучение, практика и окружение"]},
+]
+OTHER = "Другое"
+NO_EXPERIENCE = "Практически ничего не пробовал"
+LOTS_OF_STUDY = "Много изучал, но мало применял"
 
-FUNNEL_SYSTEM_PROMPT = """Ты — помощник Ильи, автора закрытого канала с лекциями по самопрограммированию.
-Говори по-русски, на «вы», тепло, коротко (2-4 предложения), без давления и без выдуманных обещаний.
 
-Что мы продаём: {product}
-
-Что известно о человеке (из квалификации):
-{profile}
-
-Правила:
-- Опирайся на его ответы, отвечай под его конкретный запрос.
-- Сначала помогай и задавай один уточняющий вопрос, не засыпай вопросами.
-- Когда человек проявил интерес к доступу или готов оплатить — предложи подписку и добавь в самый конец сообщения маркер [PAY].
-- Если человек отказался или просит не писать — вежливо попрощайся, маркер [PAY] не добавляй.
-- Не придумывай факты о курсе, которых нет в описании выше."""
-
-FUNNEL_FOLLOWUP_TASK = (
-    "Задача: напиши первое сообщение человеку. Прошло несколько дней после того, как он получил урок. "
-    "Поздоровайся, спроси, получилось ли применить урок, и мягко свяжи с его запросом. Без продажи в лоб.")
+def funnel_trunc(s, n: int = 300) -> str:
+    s = str(s or "").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def funnel_segment(a: dict) -> str:
+    """Сегмент отражает коммерческую готовность, а не оценку личности."""
+    q6 = a.get("q6_i")
+    q5 = (a.get("q5") or "").strip()
+    q4 = a.get("q4") or []
+    no_exp = q4 == [NO_EXPERIENCE]
+    if q6 == 3 and len(q5) >= 20:
+        return "ready"
+    if q6 == 0 or (q6 == 1 and no_exp and len(q5) < 20):
+        return "cold"
+    return "interested"
+
+
+def funnel_extra_problems(a: dict) -> str:
+    out = []
+    if LOTS_OF_STUDY in (a.get("q4") or []):
+        out.append("знания не превращаются в действия")
+    if a.get("q3_i") == 3:
+        out.append("устойчивый повторяющийся сценарий «на всю жизнь»")
+    if a.get("q2_i") in (1, 4) and a.get("q1_i") != 5:
+        out.append("неясность собственных желаний и предназначения" if a.get("q2_i") == 1
+                   else "разрыв между потенциалом и результатами")
+    return "; ".join(out) or "не выявлены"
+
+
+def funnel_resume(a: dict, seg: str) -> str:
+    """Короткое индивидуальное резюме по шаблонам: фразы меняются в зависимости от ответов."""
+    low = lambda s: str(s or "").strip().rstrip(".").lower()
+    parts = [f"Главный запрос сейчас: «{low(a.get('q1'))}». Основное, что мешает: «{low(a.get('q2'))}»."]
+    if a.get("q3"):
+        parts.append(f"Как давно это длится: {low(a['q3'])}.")
+    q4 = a.get("q4") or []
+    if NO_EXPERIENCE in q4:
+        parts.append("Опыта работы над собой почти нет, это первый шаг.")
+    elif LOTS_OF_STUDY in q4:
+        parts.append("Много изучал, но знания слабо превращаются в действия: нужна практика и структура.")
+    elif q4:
+        parts.append("Уже пробовал: " + ", ".join(low(x) for x in q4) + ".")
+    if (a.get("q5") or "").strip():
+        parts.append(f"Через 3 месяца хочет прийти к такому результату: «{funnel_trunc(a['q5'], 200)}».")
+    motiv = ["пока просто интересуется саморазвитием", "считает, что было бы здорово что-то изменить",
+             "давно хочет перемен, но не может начать", "готов заниматься собой и действовать"]
+    if a.get("q6_i") is not None and 0 <= a["q6_i"] < 4:
+        parts.append(f"Мотивация: {motiv[a['q6_i']]}.")
+    if a.get("q7"):
+        parts.append(f"Ближе формат: {low(a['q7'])}.")
+    return " ".join(parts)
+
+
+def funnel_card(uid: int, full_name: str, username, row, a: dict) -> str:
+    e = html.escape
+    seg = funnel_segment(a)
+    label, seg_hint, product = FUNNEL_SEGMENTS[seg]
+    q1_i = a.get("q1_i")
+    direction = FUNNEL_DIRECTIONS[q1_i] if isinstance(q1_i, int) and 0 <= q1_i < len(FUNNEL_DIRECTIONS) \
+        else FUNNEL_DIRECTIONS[-1]
+    who = f'<a href="tg://user?id={uid}">{e(full_name)}</a>' + (f" @{e(username)}" if username else "")
+    q4 = a.get("q4") or []
+    lines = [
+        "🆕 <b>Новая заявка из воронки</b>",
+        f"Пользователь: {who}, id <code>{uid}</code>",
+        f"Источник: {e(str(row['source'] or '—'))}",
+        f"Аудитория: {e(a.get('group') or '—')}",
+        f"Сегмент: <b>{label}</b> (рекомендация: {seg_hint})",
+        "",
+        "<b>Профиль</b>",
+        f"• Главный запрос: {e(funnel_trunc(a.get('q1')))}",
+        f"• Основная проблема: {e(funnel_trunc(a.get('q2')))}",
+        f"• Дополнительные проблемы: {e(funnel_extra_problems(a))}",
+        f"• Как давно: {e(a.get('q3') or '—')}",
+        f"• Предыдущий опыт: {e('; '.join(q4) or '—')}",
+        f"• Желаемый результат: {e(funnel_trunc(a.get('q5')) or '—')}",
+        f"• Мотивация: {e(a.get('q6') or '—')}",
+        f"• Формат: {e(a.get('q7') or '—')}",
+        f"• Рекомендуемое направление: {e(direction)}",
+        f"• Рекомендуемый продукт: {e(product)}",
+        "",
+        "<b>Резюме</b>",
+        e(funnel_resume(a, seg)),
+        "",
+        "<i>Сегмент отражает коммерческую готовность, а не оценку личности.</i>",
+    ]
+    return "\n".join(lines)
+
+
+# ---------- база ----------
 def funnel_get(uid: int):
     return db.execute("SELECT * FROM funnel_users WHERE user_id=?", (uid,)).fetchone()
 
 
+def funnel_answers(row) -> dict:
+    return json.loads(row["answers"] or "{}")
+
+
+def funnel_update(uid: int, **fields):
+    keys = ", ".join(f"{k}=?" for k in fields)
+    db.execute(f"UPDATE funnel_users SET {keys} WHERE user_id=?", (*fields.values(), uid))
+    db.commit()
+
+
 def funnel_reset(uid: int, source: str):
-    db.execute("DELETE FROM funnel_messages WHERE user_id=?", (uid,))
-    db.execute("""INSERT INTO funnel_users(user_id, source, answers, step, done, lesson,
-                                           followup_at, followup_sent, optout, created)
-                  VALUES(?,?,'{}',0,0,NULL,NULL,0,0,?)
-                  ON CONFLICT(user_id) DO UPDATE SET source=excluded.source, answers='{}', step=0,
-                    done=0, lesson=NULL, followup_at=NULL, followup_sent=0, optout=0""",
+    db.execute("""INSERT INTO funnel_users(user_id, source, answers, stage, step, tmp, done, created)
+                  VALUES(?,?,'{}','group',0,'[]',0,?)
+                  ON CONFLICT(user_id) DO UPDATE SET source=excluded.source, answers='{}',
+                    stage='group', step=0, tmp='[]', done=0""",
                (uid, source, int(time.time())))
     db.commit()
 
 
-def funnel_save(uid: int, role: str, content: str):
-    db.execute("INSERT INTO funnel_messages(user_id, role, content, ts) VALUES(?,?,?,?)",
-               (uid, role, content, int(time.time())))
-    db.commit()
+def funnel_set_answer(uid: int, key: str, value, idx=None):
+    a = funnel_answers(funnel_get(uid))
+    a[key] = value
+    a[key + "_i"] = idx
+    funnel_update(uid, answers=json.dumps(a, ensure_ascii=False))
 
 
-def funnel_history(uid: int, limit: int = 20) -> list:
-    rows = db.execute("SELECT role, content FROM funnel_messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
-                      (uid, limit)).fetchall()
-    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+# ---------- шаги ----------
+def funnel_test_text(qi: int) -> str:
+    q = FUNNEL_TEST[qi]
+    text = f"<b>Вопрос {qi + 1} из {len(FUNNEL_TEST)}</b>\n{html.escape(q['text'])}"
+    if q["options"]:
+        text += "\n\n" + "\n".join(f"{i + 1}. {html.escape(o)}" for i, o in enumerate(q["options"]))
+    if q["free"] and q["type"] != "text":
+        text += "\n\n<i>Можно выбрать номер кнопкой или написать свой ответ сообщением.</i>"
+    return text
 
 
-def funnel_profile(user) -> str:
-    answers = json.loads(user["answers"] or "{}")
-    lines = [f"- {q['text'][4:]} {answers[q['key']]}" for q in FUNNEL_QUESTIONS if q["key"] in answers]
-    if user["source"]:
-        lines.append(f"- Пришёл из: {user['source']}")
-    return "\n".join(lines) or "- данных нет"
-
-
-async def funnel_llm(user, task: str | None = None) -> str:
-    messages = [{"role": "system", "content": FUNNEL_SYSTEM_PROMPT.format(
-        product=FUNNEL_PRODUCT, profile=funnel_profile(user))}]
-    messages += funnel_history(user["user_id"])
-    if task:
-        messages.append({"role": "system", "content": task})
-    headers = {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
-    payload = {"model": LLM_MODEL, "messages": messages, "stream": False}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
-        async with session.post(f"{LLM_URL}/api/chat", json=payload, headers=headers) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-    return data["message"]["content"].strip()
-
-
-async def funnel_send_llm(uid: int, text: str):
-    """Отправляет ответ LLM. Маркер [PAY] превращается в кнопку, которая открывает обычную оплату."""
-    want_pay = "[PAY]" in text
-    clean = text.replace("[PAY]", "").strip() or "Оформить подписку можно по кнопке ниже."
-    funnel_save(uid, "assistant", clean)
-    kb = markup([btn("💳 Оформить подписку", "buy")]) if want_pay else None
-    await bot.send_message(uid, html.escape(clean), reply_markup=kb)
-
-
-def funnel_question_markup(qi: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=opt, callback_data=f"fq:{qi}:{oi}")]
-        for oi, opt in enumerate(FUNNEL_QUESTIONS[qi]["options"])])
+def funnel_test_markup(qi: int, selected=()):
+    q = FUNNEL_TEST[qi]
+    if not q["options"]:
+        return None
+    buttons = []
+    for oi in range(len(q["options"])):
+        mark = "✅" if (q["type"] == "multi" and oi in selected) else ""
+        buttons.append(InlineKeyboardButton(text=f"{mark}{oi + 1}", callback_data=f"ft:{qi}:{oi}"))
+    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+    if q["type"] == "multi":
+        rows.append([btn("Готово ➡️", f"ftd:{qi}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def funnel_ask(uid: int, qi: int):
-    await bot.send_message(uid, FUNNEL_QUESTIONS[qi]["text"], reply_markup=funnel_question_markup(qi))
+    await bot.send_message(uid, funnel_test_text(qi), reply_markup=funnel_test_markup(qi))
+
+
+async def funnel_next(uid: int):
+    step = funnel_get(uid)["step"] + 1
+    if step < len(FUNNEL_TEST):
+        funnel_update(uid, step=step, tmp="[]")
+        await funnel_ask(uid, step)
+    else:
+        await funnel_finish(uid)
+
+
+async def funnel_build_card(uid: int):
+    row = funnel_get(uid)
+    u = db.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
+    try:
+        chat = await bot.get_chat(uid)
+        full_name = chat.full_name or str(uid)
+    except Exception:
+        full_name = str(uid)
+    a = funnel_answers(row)
+    return funnel_card(uid, full_name, u["username"] if u else None, row, a), full_name, funnel_segment(a)
+
+
+def crm_log(uid: int, direction: str, m: Message):
+    """Сохраняет переписку в базу (пригодится для будущего веб-интерфейса)."""
+    text = m.text or m.caption or f"[{m.content_type}]"
+    db.execute("INSERT INTO crm_messages(user_id, direction, text, ts) VALUES(?,?,?,?)",
+               (uid, direction, text, int(time.time())))
+    db.commit()
+
+
+async def crm_topic(uid: int):
+    """Тема лида в CRM-группе: возвращает id темы, создаёт при необходимости. None, если CRM не настроена."""
+    if not CRM_CHAT_ID:
+        return None
+    r = db.execute("SELECT thread_id FROM crm_topics WHERE user_id=?", (uid,)).fetchone()
+    if r:
+        return r["thread_id"]
+    try:
+        card, name, seg = await funnel_build_card(uid)
+        title = f"{name} · {FUNNEL_SEGMENTS[seg][0]}"[:128]
+        topic = await bot.create_forum_topic(CRM_CHAT_ID, title, icon_color=FUNNEL_TOPIC_COLORS[seg])
+        thread = topic.message_thread_id
+        sent = await bot.send_message(
+            CRM_CHAT_ID, card + "\n\n<i>Отвечайте прямо в этой теме: сообщение уйдёт пользователю.</i>",
+            message_thread_id=thread)
+        try:
+            await bot.pin_chat_message(CRM_CHAT_ID, sent.message_id, disable_notification=True)
+        except Exception:
+            logging.warning("не удалось закрепить карточку лида")
+        db.execute("INSERT OR REPLACE INTO crm_topics(user_id, chat_id, thread_id) VALUES(?,?,?)",
+                   (uid, CRM_CHAT_ID, thread))
+        db.commit()
+        return thread
+    except Exception:
+        logging.exception("не удалось создать тему в CRM-группе (бот админ с правом «Управление темами»?)")
+        return None
+
+
+async def funnel_card_to_admin(uid: int):
+    card, _, _ = await funnel_build_card(uid)
+    kb = markup([btn("✉️ Написать ему", f"users:message:{uid}:0")],
+                [btn("👤 Карточка пользователя", f"users:view:{uid}:0")])
+    try:
+        await bot.send_message(ADMIN_ID, card, reply_markup=kb)
+    except Exception:
+        logging.exception("не удалось отправить профиль админу")
+
+
+async def funnel_finish(uid: int):
+    funnel_update(uid, stage="done", done=1, tmp="[]")
+    await bot.send_message(uid, FUNNEL_THANKS)
+    if await crm_topic(uid) is None:  # CRM-группа не настроена или тема не создалась: профиль в личку админу
+        await funnel_card_to_admin(uid)
+
+
+async def funnel_send_video(uid: int):
+    kb = markup([btn("✅ Я посмотрел", "fv:ok")])
+    v = FUNNEL_VIDEO.strip()
+    text = FUNNEL_VIDEO_TEXT
+    if v and not v.startswith("http"):  # file_id видео
+        try:
+            await bot.send_video(uid, v, caption=text, reply_markup=kb)
+            return
+        except Exception:
+            logging.exception("не удалось отправить видео воронки")
+    text += f"\n\n{v}" if v.startswith("http") else "\n\n(видео будет добавлено позже)"
+    await bot.send_message(uid, text, reply_markup=kb)
 
 
 async def funnel_start(m: Message, payload: str):
@@ -829,109 +1059,245 @@ async def funnel_start(m: Message, payload: str):
     ensure_user(uid, m.from_user.username)
     funnel_reset(uid, payload)
     await m.answer(FUNNEL_GREETING)
+    kb = markup(*[[btn(label, f"fg:{i}")] for i, (label, _) in enumerate(FUNNEL_GROUPS)])
+    await bot.send_message(uid, FUNNEL_GROUP_Q, reply_markup=kb)
+
+
+async def funnel_clear_buttons(cb: CallbackQuery):
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+# ---------- обработчики ----------
+@dp.callback_query(F.data.startswith("fg:"))
+async def funnel_group(cb: CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    row = funnel_get(uid)
+    try:
+        i = int(cb.data.split(":")[1])
+        assert 0 <= i < len(FUNNEL_GROUPS)
+    except (ValueError, AssertionError):
+        return
+    if not row or row["stage"] != "group":
+        return
+    funnel_set_answer(uid, "group", FUNNEL_GROUPS[i][1], i)
+    funnel_update(uid, stage="video")
+    await funnel_clear_buttons(cb)
+    await bot.send_message(uid, FUNNEL_LESSON)
+    await funnel_send_video(uid)
+
+
+@dp.callback_query(F.data == "fv:ok")
+async def funnel_watched(cb: CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    row = funnel_get(uid)
+    if not row or row["stage"] != "video":
+        return
+    funnel_update(uid, stage="test", step=0, tmp="[]")
+    try:  # кнопку убираем, подпись у видео остаётся
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await bot.send_message(uid, FUNNEL_TEST_INTRO)
     await funnel_ask(uid, 0)
 
 
-@dp.callback_query(F.data.startswith("fq:"))
-async def funnel_answer(cb: CallbackQuery):
-    uid = cb.from_user.id
+@dp.callback_query(F.data.startswith("ft:"))
+async def funnel_test_answer(cb: CallbackQuery):
     await cb.answer()
-    user = funnel_get(uid)
+    uid = cb.from_user.id
+    row = funnel_get(uid)
     try:
         _, qi, oi = cb.data.split(":")
         qi, oi = int(qi), int(oi)
-    except ValueError:
+        q = FUNNEL_TEST[qi]
+        opt = q["options"][oi]
+    except (ValueError, IndexError):
         return
-    if not user or user["done"] or qi != user["step"]:  # защита от повторных нажатий на старые кнопки
+    if not row or row["stage"] != "test" or row["step"] != qi:  # защита от старых кнопок
         return
-    answers = json.loads(user["answers"] or "{}")
-    answers[FUNNEL_QUESTIONS[qi]["key"]] = FUNNEL_QUESTIONS[qi]["options"][oi]
-    next_step = qi + 1
-    db.execute("UPDATE funnel_users SET answers=?, step=? WHERE user_id=?",
-               (json.dumps(answers, ensure_ascii=False), next_step, uid))
-    db.commit()
-    if next_step < len(FUNNEL_QUESTIONS):
-        await funnel_ask(uid, next_step)
+    if q["type"] == "multi":
+        selected = set(json.loads(row["tmp"] or "[]"))
+        selected ^= {oi}
+        funnel_update(uid, tmp=json.dumps(sorted(selected)))
+        try:
+            await cb.message.edit_reply_markup(reply_markup=funnel_test_markup(qi, selected))
+        except Exception:
+            pass
         return
-    lesson = FUNNEL_LESSONS.get(answers.get("goal"), FUNNEL_DEFAULT_LESSON)
-    db.execute("UPDATE funnel_users SET done=1, lesson=?, followup_at=? WHERE user_id=?",
-               (lesson, int(time.time()) + FOLLOWUP_DELAY_MIN * 60, uid))
-    db.commit()
-    await bot.send_message(uid, "Спасибо! Я подобрал урок под ваши ответы:")
-    await bot.send_message(uid, lesson)
-    await bot.send_message(uid, "Если появятся вопросы, просто напишите мне сюда. Отключить сообщения: /stop")
+    if opt == OTHER:
+        await bot.send_message(uid, "Напишите свой вариант одним сообщением 👇")
+        return
+    funnel_set_answer(uid, q["key"], opt, oi)
+    await funnel_clear_buttons(cb)
+    await funnel_next(uid)
 
 
-@dp.message(Command("stop"))
-async def funnel_stop(m: Message):
-    if not funnel_get(m.from_user.id):
-        await m.answer("Рассылки от меня у вас не включены.")
+@dp.callback_query(F.data.startswith("ftd:"))
+async def funnel_test_multi_done(cb: CallbackQuery):
+    uid = cb.from_user.id
+    row = funnel_get(uid)
+    try:
+        qi = int(cb.data.split(":")[1])
+        q = FUNNEL_TEST[qi]
+    except (ValueError, IndexError):
+        await cb.answer()
         return
-    db.execute("UPDATE funnel_users SET optout=1 WHERE user_id=?", (m.from_user.id,))
-    db.commit()
-    await m.answer("Хорошо, больше не буду писать. Если захотите вернуться, нажмите на ссылку из Instagram ещё раз.")
+    if not row or row["stage"] != "test" or row["step"] != qi:
+        await cb.answer()
+        return
+    selected = sorted(json.loads(row["tmp"] or "[]"))
+    if not selected:
+        await cb.answer("Выберите хотя бы один вариант.", show_alert=True)
+        return
+    await cb.answer()
+    funnel_set_answer(uid, q["key"], [q["options"][i] for i in selected], selected)
+    await funnel_clear_buttons(cb)
+    await funnel_next(uid)
 
 
-@dp.message(Command("followup_now"))
-async def funnel_followup_now(m: Message):  # для теста: дожим сразу, не дожидаясь задержки
-    if m.from_user.id != ADMIN_ID:
+@dp.message(Command("chatid"))
+async def crm_chat_id(m: Message):
+    """Админ отправляет /chatid в группе и получает id для переменной CRM_CHAT_ID."""
+    if m.from_user.id == ADMIN_ID:
+        await m.answer(f"id этого чата (вставьте в переменную CRM_CHAT_ID):\n<code>{m.chat.id}</code>")
+
+
+T_PAY_REQUEST = "Чтобы оформить подписку, нажмите на кнопку ниже 👇"
+
+
+async def crm_send_pay(m: Message, uid: int, custom: str):
+    """/pay в теме лида: пользователю уходит сообщение с кнопкой оплаты (карточка, оферта, оплата)."""
+    sub = active_subscription(uid)
+    if sub:
+        await m.reply(f"У пользователя уже активная подписка до {fmt(datetime.fromisoformat(sub['expires_at']))}. "
+                      "Форму оплаты не отправляю.")
         return
-    db.execute("UPDATE funnel_users SET followup_at=0, followup_sent=0, optout=0 WHERE user_id=? AND done=1",
-               (m.from_user.id,))
+    try:
+        await bot.send_message(uid, html.escape(custom) if custom else T_PAY_REQUEST, reply_markup=KB_START)
+    except Exception:
+        logging.exception("не удалось отправить форму оплаты пользователю %s", uid)
+        await m.reply("⚠️ Не удалось отправить: пользователь мог заблокировать бота.")
+        return
+    db.execute("INSERT INTO crm_messages(user_id, direction, text, ts) VALUES(?,?,?,?)",
+               (uid, "out", "[форма оплаты]" + (f" {custom}" if custom else ""), int(time.time())))
     db.commit()
-    await m.answer("Ок, сообщение от LLM придёт в течение 30 секунд.")
+    db.execute("UPDATE users SET pay_started_at=? WHERE user_id=? AND active=0", (iso(now()), uid))
+    db.commit()
+    await m.reply("✅ Форма оплаты отправлена.")
+
+
+async def crm_notify(uid: int, text: str):
+    """Короткая пометка в теме лида (например, об оплате). Ничего не делает, если темы нет."""
+    if not CRM_CHAT_ID:
+        return
+    r = db.execute("SELECT thread_id FROM crm_topics WHERE user_id=?", (uid,)).fetchone()
+    if not r:
+        return
+    try:
+        await bot.send_message(CRM_CHAT_ID, text, message_thread_id=r["thread_id"])
+    except Exception:
+        logging.warning("не удалось написать в CRM-тему %s", uid)
+
+
+CRM_RELAY_TYPES = {"text", "photo", "video", "voice", "video_note", "audio", "document", "sticker", "animation"}
+
+
+@dp.message(F.chat.id == CRM_CHAT_ID)
+async def crm_group_message(m: Message):
+    """Админ пишет в теме лида: сообщение уходит пользователю. Остальное в CRM-группе игнорируем."""
+    if not m.from_user or m.from_user.id != ADMIN_ID or not m.message_thread_id:
+        return
+    if m.content_type not in CRM_RELAY_TYPES:
+        return
+    r = db.execute("SELECT user_id FROM crm_topics WHERE chat_id=? AND thread_id=?",
+                   (m.chat.id, m.message_thread_id)).fetchone()
+    if not r:
+        return
+    uid = r["user_id"]
+    if m.text and m.text.startswith("/"):
+        parts = m.text.split(maxsplit=1)
+        if parts[0].split("@")[0].lower() == "/pay":  # /pay или /pay свой текст
+            await crm_send_pay(m, uid, parts[1].strip() if len(parts) > 1 else "")
+        return
+    try:
+        await bot.copy_message(uid, m.chat.id, m.message_id)
+    except Exception:
+        logging.exception("не удалось доставить сообщение пользователю %s", uid)
+        await m.reply("⚠️ Не удалось доставить: пользователь мог заблокировать бота.")
+        return
+    crm_log(uid, "out", m)
+
+
+@dp.message(F.from_user.id == ADMIN_ID, F.chat.type == "private", F.video)
+async def funnel_video_id(m: Message):
+    """Админ отправляет видео боту и получает file_id для FUNNEL_VIDEO."""
+    await m.answer(f"file_id видео (вставьте в переменную FUNNEL_VIDEO):\n<code>{m.video.file_id}</code>")
 
 
 async def funnel_chat_filter(m: Message) -> bool:
-    """Свободный текст уходит в LLM только у тех, кто прошёл воронку и ещё не оплатил."""
+    """Сообщения людей из воронки: ответы теста текстом и переписка с администратором."""
     uid = m.from_user.id
-    if m.reply_to_message or uid in awaiting_help:  # реплаи и «связь с админом» остаются за старым кодом
+    if m.chat.type != "private":
         return False
-    if active_subscription(uid):
+    if m.text and m.text.startswith("/"):
         return False
+    if uid in awaiting_help or active_subscription(uid):
+        return False
+    if m.reply_to_message and support_user(uid, m.reply_to_message.message_id) == uid:
+        return False  # ответ на сообщение админа: обработает any_message
     row = funnel_get(uid)
-    return bool(row and row["done"] and not row["optout"])
+    if not row:
+        return False
+    if uid == ADMIN_ID and (m.reply_to_message or row["stage"] == "done" or not m.text):
+        return False  # админ не должен «застревать» в воронке при ответах и /restore
+    return True
 
 
-@dp.message(F.text, ~F.text.startswith("/"), funnel_chat_filter)
-async def funnel_chat(m: Message):
+@dp.message(funnel_chat_filter)
+async def funnel_message(m: Message):
     uid = m.from_user.id
-    funnel_save(uid, "user", m.text)
-    try:
-        await bot.send_chat_action(uid, "typing")
-        reply = await funnel_llm(funnel_get(uid))
-    except Exception:
-        logging.exception("ошибка LLM")
-        await m.answer("Минутку, отвечу чуть позже.")
+    row = funnel_get(uid)
+    stage = row["stage"]
+    if stage == "group" or stage == "video":
+        await m.answer("Нажмите, пожалуйста, на кнопку выше 👆")
         return
-    await funnel_send_llm(uid, reply)
-
-
-async def funnel_followup_loop():
-    """Раз в 30 секунд ищет тех, кому пора написать первым, и пишет через LLM."""
-    while True:
+    if stage == "test":
+        qi = row["step"]
+        q = FUNNEL_TEST[qi]
+        if not m.text:
+            await m.answer("Ответьте, пожалуйста, текстом или выберите вариант кнопкой.")
+            return
+        if not q["free"]:
+            await m.answer("Выберите вариант кнопкой выше 👆")
+            return
+        funnel_set_answer(uid, q["key"], m.text.strip(), -1)
+        await funnel_next(uid)
+        return
+    # stage == "done": дальше переписка с администратором
+    crm_log(uid, "in", m)
+    thread = await crm_topic(uid)
+    if thread:
         try:
-            rows = db.execute("SELECT user_id FROM funnel_users WHERE done=1 AND followup_sent=0 "
-                              "AND optout=0 AND followup_at<=?", (int(time.time()),)).fetchall()
-            for row in rows:
-                uid = row["user_id"]
-                if active_subscription(uid):  # уже оплатил, не дожимаем
-                    db.execute("UPDATE funnel_users SET followup_sent=1 WHERE user_id=?", (uid,))
-                    db.commit()
-                    continue
-                try:
-                    text = await funnel_llm(funnel_get(uid), task=FUNNEL_FOLLOWUP_TASK)
-                    await funnel_send_llm(uid, text)
-                    db.execute("UPDATE funnel_users SET followup_sent=1 WHERE user_id=?", (uid,))
-                    db.commit()
-                except TelegramForbiddenError:
-                    db.execute("UPDATE funnel_users SET optout=1 WHERE user_id=?", (uid,))
-                    db.commit()
-                except Exception:
-                    logging.exception("дожим не удался для %s", uid)
+            await bot.copy_message(CRM_CHAT_ID, uid, m.message_id, message_thread_id=thread)
         except Exception:
-            logging.exception("ошибка цикла дожима")
-        await asyncio.sleep(30)
+            logging.exception("не удалось переслать сообщение в CRM-тему")
+    else:
+        who = html.escape(m.from_user.full_name) + (f" (@{html.escape(m.from_user.username)})"
+                                                     if m.from_user.username else "")
+        header = await bot.send_message(
+            ADMIN_ID, f"💬 Сообщение от {who}, id <code>{uid}</code>.\n"
+                      "Ответьте реплаем на это сообщение или на пересланное.")
+        link_support_message(ADMIN_ID, header.message_id, uid)
+        forwarded = await m.copy_to(ADMIN_ID)
+        link_support_message(ADMIN_ID, forwarded.message_id, uid)
+    if row["tmp"] != '["ack"]':
+        funnel_update(uid, tmp='["ack"]')
+        await m.answer("Передал администратору. Ответ придёт сюда.")
 # ====================== конец блока FUNNEL ======================
 
 
@@ -1835,7 +2201,6 @@ async def main():
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
     asyncio.create_task(scheduler())
-    asyncio.create_task(funnel_followup_loop())
     await dp.start_polling(bot)
 
 
