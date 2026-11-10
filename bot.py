@@ -3,9 +3,14 @@
 Воронка: /start или /join -> кнопка -> карточка товара + оферта -> оплата -> доступ в канал
 -> напоминания -> (автосписание) -> закрытие доступа. /help — связь с владельцем.
 Все тексты бота лежат в блоке TEXTS ниже: правьте формулировки там.
+
+Воронка из Instagram (в этом же файле, блок FUNNEL): ссылка t.me/бот?start=insta -> квалификация
+-> урок под ответы -> через несколько минут/дней LLM пишет первой -> диалог -> кнопка оплаты.
+Обычный /start работает как раньше.
 """
 import asyncio
 import html
+import json
 import logging
 import math
 import os
@@ -16,11 +21,13 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.exceptions import TelegramForbiddenError
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (BotCommand, CallbackQuery, FSInputFile, InlineKeyboardButton,
                            BotCommandScopeChat, InlineKeyboardMarkup, Message)
 from aiohttp import web
@@ -49,6 +56,12 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "bot.db")
 PAYMENT_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Inter.png")
 BACKUP_HOURS = float(os.getenv("BACKUP_HOURS", "24"))  # как часто бот присылает вам копию базы
+# --- воронка из Instagram ---
+FUNNEL_PREFIX = os.getenv("FUNNEL_PAYLOAD_PREFIX", "insta")        # ссылка вида t.me/бот?start=insta
+LLM_URL = os.getenv("LLM_URL", "http://localhost:11434").rstrip("/")  # адрес вашей LLM (формат Ollama API)
+LLM_MODEL = os.getenv("LLM_MODEL", "llama3.1")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")                         # если API закрыт ключом
+FOLLOWUP_DELAY_MIN = int(os.getenv("FOLLOWUP_DELAY_MIN", "4320"))  # для теста 2; 4320 = 3 дня
 # ============================== TEXTS ==============================
 # Разметка: <b>жирный</b>, <i>курсив</i>. Подстановки в {фигурных скобках} не трогайте.
 T_WELCOME = ("Привет, я бот Круга Ильи Хабирова. Я выдаю доступ к закрытому каналу с лекциями.\n"
@@ -123,6 +136,12 @@ CREATE TABLE IF NOT EXISTS support_links(
   chat_id INTEGER, message_id INTEGER, user_id INTEGER,
   PRIMARY KEY(chat_id, message_id));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS funnel_users(
+  user_id INTEGER PRIMARY KEY, source TEXT, answers TEXT DEFAULT '{}', step INTEGER DEFAULT 0,
+  done INTEGER DEFAULT 0, lesson TEXT, followup_at INTEGER, followup_sent INTEGER DEFAULT 0,
+  optout INTEGER DEFAULT 0, created INTEGER);
+CREATE TABLE IF NOT EXISTS funnel_messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, role TEXT, content TEXT, ts INTEGER);
 """
 
 
@@ -592,7 +611,11 @@ async def set_subscription_days(uid: int, days: float):
 
 # ---------- Воронка: /start -> оплата ----------
 @dp.message(Command("start", "join"))
-async def start(m: Message):
+async def start(m: Message, command: CommandObject):
+    payload = (command.args or "").strip()
+    if payload.startswith(FUNNEL_PREFIX) and not active_subscription(m.from_user.id):
+        await funnel_start(m, payload)  # пришёл по ссылке из Instagram -> воронка с квалификацией
+        return
     ensure_user(m.from_user.id, m.from_user.username)
     u = db.execute("SELECT * FROM users WHERE user_id=?", (m.from_user.id,)).fetchone()
     if active_subscription(m.from_user.id):
@@ -680,6 +703,236 @@ async def help_btn(cb: CallbackQuery):
     awaiting_help.add(cb.from_user.id)
     await cb.message.answer(T_HELP_PROMPT)
     await cb.answer()
+
+
+# ====================== FUNNEL: Instagram -> квалификация -> урок -> дожим LLM -> оплата ======================
+# Тексты воронки. Разметка HTML (<b>, <i>, <a href="...">) работает в приветствии, вопросах и уроках.
+FUNNEL_GREETING = ("Привет! Я подготовлю для вас урок под ваш запрос.\n"
+                   "Ответьте на 3 коротких вопроса, это займёт минуту.")
+
+FUNNEL_QUESTIONS = [
+    {"key": "goal", "text": "1/3. Что для вас сейчас важнее всего?",
+     "options": ["Понять себя", "Изменить привычки", "Выйти на новый доход", "Снять тревогу и стресс"]},
+    {"key": "level", "text": "2/3. Как давно вы занимаетесь саморазвитием?",
+     "options": ["Только начинаю", "Пробовал(а) разное", "Давно в теме"]},
+    {"key": "pain", "text": "3/3. Что мешает больше всего?",
+     "options": ["Не хватает дисциплины", "Не знаю, с чего начать", "Нет времени", "Сомнения в себе"]},
+]
+
+# Урок под ответ на первый вопрос. Замените заглушки на свои ссылки.
+FUNNEL_LESSONS = {
+    "Понять себя": "Ваш урок: «Как услышать себя». Ссылка: https://example.com/lesson-self",
+    "Изменить привычки": "Ваш урок: «Перепрограммирование привычек». Ссылка: https://example.com/lesson-habits",
+    "Выйти на новый доход": "Ваш урок: «Деньги и установки». Ссылка: https://example.com/lesson-money",
+    "Снять тревогу и стресс": "Ваш урок: «Спокойствие за 10 минут». Ссылка: https://example.com/lesson-calm",
+}
+FUNNEL_DEFAULT_LESSON = "Ваш урок: https://example.com/lesson-default"
+
+# Описание продукта для LLM, чтобы она ничего не выдумывала.
+FUNNEL_PRODUCT = (
+    f"ежемесячная подписка ({PRICE:.0f} ₽ за {PERIOD_DAYS:g} дн.) на закрытый Telegram-канал «Круг» с лекциями "
+    "и статьями о духовном и личностном развитии. Канал обновляется каждый месяц. Помимо статей, в подписке "
+    "есть видеолекции (обычно час и более) на те же темы, но с более глубоким погружением вместе с автором. "
+    "Примеры статей есть в бесплатном канале @habirov_cyrcle.")
+
+FUNNEL_SYSTEM_PROMPT = """Ты — помощник Ильи, автора закрытого канала с лекциями по самопрограммированию.
+Говори по-русски, на «вы», тепло, коротко (2-4 предложения), без давления и без выдуманных обещаний.
+
+Что мы продаём: {product}
+
+Что известно о человеке (из квалификации):
+{profile}
+
+Правила:
+- Опирайся на его ответы, отвечай под его конкретный запрос.
+- Сначала помогай и задавай один уточняющий вопрос, не засыпай вопросами.
+- Когда человек проявил интерес к доступу или готов оплатить — предложи подписку и добавь в самый конец сообщения маркер [PAY].
+- Если человек отказался или просит не писать — вежливо попрощайся, маркер [PAY] не добавляй.
+- Не придумывай факты о курсе, которых нет в описании выше."""
+
+FUNNEL_FOLLOWUP_TASK = (
+    "Задача: напиши первое сообщение человеку. Прошло несколько дней после того, как он получил урок. "
+    "Поздоровайся, спроси, получилось ли применить урок, и мягко свяжи с его запросом. Без продажи в лоб.")
+
+
+def funnel_get(uid: int):
+    return db.execute("SELECT * FROM funnel_users WHERE user_id=?", (uid,)).fetchone()
+
+
+def funnel_reset(uid: int, source: str):
+    db.execute("DELETE FROM funnel_messages WHERE user_id=?", (uid,))
+    db.execute("""INSERT INTO funnel_users(user_id, source, answers, step, done, lesson,
+                                           followup_at, followup_sent, optout, created)
+                  VALUES(?,?,'{}',0,0,NULL,NULL,0,0,?)
+                  ON CONFLICT(user_id) DO UPDATE SET source=excluded.source, answers='{}', step=0,
+                    done=0, lesson=NULL, followup_at=NULL, followup_sent=0, optout=0""",
+               (uid, source, int(time.time())))
+    db.commit()
+
+
+def funnel_save(uid: int, role: str, content: str):
+    db.execute("INSERT INTO funnel_messages(user_id, role, content, ts) VALUES(?,?,?,?)",
+               (uid, role, content, int(time.time())))
+    db.commit()
+
+
+def funnel_history(uid: int, limit: int = 20) -> list:
+    rows = db.execute("SELECT role, content FROM funnel_messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                      (uid, limit)).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+def funnel_profile(user) -> str:
+    answers = json.loads(user["answers"] or "{}")
+    lines = [f"- {q['text'][4:]} {answers[q['key']]}" for q in FUNNEL_QUESTIONS if q["key"] in answers]
+    if user["source"]:
+        lines.append(f"- Пришёл из: {user['source']}")
+    return "\n".join(lines) or "- данных нет"
+
+
+async def funnel_llm(user, task: str | None = None) -> str:
+    messages = [{"role": "system", "content": FUNNEL_SYSTEM_PROMPT.format(
+        product=FUNNEL_PRODUCT, profile=funnel_profile(user))}]
+    messages += funnel_history(user["user_id"])
+    if task:
+        messages.append({"role": "system", "content": task})
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
+    payload = {"model": LLM_MODEL, "messages": messages, "stream": False}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
+        async with session.post(f"{LLM_URL}/api/chat", json=payload, headers=headers) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    return data["message"]["content"].strip()
+
+
+async def funnel_send_llm(uid: int, text: str):
+    """Отправляет ответ LLM. Маркер [PAY] превращается в кнопку, которая открывает обычную оплату."""
+    want_pay = "[PAY]" in text
+    clean = text.replace("[PAY]", "").strip() or "Оформить подписку можно по кнопке ниже."
+    funnel_save(uid, "assistant", clean)
+    kb = markup([btn("💳 Оформить подписку", "buy")]) if want_pay else None
+    await bot.send_message(uid, html.escape(clean), reply_markup=kb)
+
+
+def funnel_question_markup(qi: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=opt, callback_data=f"fq:{qi}:{oi}")]
+        for oi, opt in enumerate(FUNNEL_QUESTIONS[qi]["options"])])
+
+
+async def funnel_ask(uid: int, qi: int):
+    await bot.send_message(uid, FUNNEL_QUESTIONS[qi]["text"], reply_markup=funnel_question_markup(qi))
+
+
+async def funnel_start(m: Message, payload: str):
+    uid = m.from_user.id
+    ensure_user(uid, m.from_user.username)
+    funnel_reset(uid, payload)
+    await m.answer(FUNNEL_GREETING)
+    await funnel_ask(uid, 0)
+
+
+@dp.callback_query(F.data.startswith("fq:"))
+async def funnel_answer(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await cb.answer()
+    user = funnel_get(uid)
+    try:
+        _, qi, oi = cb.data.split(":")
+        qi, oi = int(qi), int(oi)
+    except ValueError:
+        return
+    if not user or user["done"] or qi != user["step"]:  # защита от повторных нажатий на старые кнопки
+        return
+    answers = json.loads(user["answers"] or "{}")
+    answers[FUNNEL_QUESTIONS[qi]["key"]] = FUNNEL_QUESTIONS[qi]["options"][oi]
+    next_step = qi + 1
+    db.execute("UPDATE funnel_users SET answers=?, step=? WHERE user_id=?",
+               (json.dumps(answers, ensure_ascii=False), next_step, uid))
+    db.commit()
+    if next_step < len(FUNNEL_QUESTIONS):
+        await funnel_ask(uid, next_step)
+        return
+    lesson = FUNNEL_LESSONS.get(answers.get("goal"), FUNNEL_DEFAULT_LESSON)
+    db.execute("UPDATE funnel_users SET done=1, lesson=?, followup_at=? WHERE user_id=?",
+               (lesson, int(time.time()) + FOLLOWUP_DELAY_MIN * 60, uid))
+    db.commit()
+    await bot.send_message(uid, "Спасибо! Я подобрал урок под ваши ответы:")
+    await bot.send_message(uid, lesson)
+    await bot.send_message(uid, "Если появятся вопросы, просто напишите мне сюда. Отключить сообщения: /stop")
+
+
+@dp.message(Command("stop"))
+async def funnel_stop(m: Message):
+    if not funnel_get(m.from_user.id):
+        await m.answer("Рассылки от меня у вас не включены.")
+        return
+    db.execute("UPDATE funnel_users SET optout=1 WHERE user_id=?", (m.from_user.id,))
+    db.commit()
+    await m.answer("Хорошо, больше не буду писать. Если захотите вернуться, нажмите на ссылку из Instagram ещё раз.")
+
+
+@dp.message(Command("followup_now"))
+async def funnel_followup_now(m: Message):  # для теста: дожим сразу, не дожидаясь задержки
+    if m.from_user.id != ADMIN_ID:
+        return
+    db.execute("UPDATE funnel_users SET followup_at=0, followup_sent=0, optout=0 WHERE user_id=? AND done=1",
+               (m.from_user.id,))
+    db.commit()
+    await m.answer("Ок, сообщение от LLM придёт в течение 30 секунд.")
+
+
+async def funnel_chat_filter(m: Message) -> bool:
+    """Свободный текст уходит в LLM только у тех, кто прошёл воронку и ещё не оплатил."""
+    uid = m.from_user.id
+    if m.reply_to_message or uid in awaiting_help:  # реплаи и «связь с админом» остаются за старым кодом
+        return False
+    if active_subscription(uid):
+        return False
+    row = funnel_get(uid)
+    return bool(row and row["done"] and not row["optout"])
+
+
+@dp.message(F.text, ~F.text.startswith("/"), funnel_chat_filter)
+async def funnel_chat(m: Message):
+    uid = m.from_user.id
+    funnel_save(uid, "user", m.text)
+    try:
+        await bot.send_chat_action(uid, "typing")
+        reply = await funnel_llm(funnel_get(uid))
+    except Exception:
+        logging.exception("ошибка LLM")
+        await m.answer("Минутку, отвечу чуть позже.")
+        return
+    await funnel_send_llm(uid, reply)
+
+
+async def funnel_followup_loop():
+    """Раз в 30 секунд ищет тех, кому пора написать первым, и пишет через LLM."""
+    while True:
+        try:
+            rows = db.execute("SELECT user_id FROM funnel_users WHERE done=1 AND followup_sent=0 "
+                              "AND optout=0 AND followup_at<=?", (int(time.time()),)).fetchall()
+            for row in rows:
+                uid = row["user_id"]
+                if active_subscription(uid):  # уже оплатил, не дожимаем
+                    db.execute("UPDATE funnel_users SET followup_sent=1 WHERE user_id=?", (uid,))
+                    db.commit()
+                    continue
+                try:
+                    text = await funnel_llm(funnel_get(uid), task=FUNNEL_FOLLOWUP_TASK)
+                    await funnel_send_llm(uid, text)
+                    db.execute("UPDATE funnel_users SET followup_sent=1 WHERE user_id=?", (uid,))
+                    db.commit()
+                except TelegramForbiddenError:
+                    db.execute("UPDATE funnel_users SET optout=1 WHERE user_id=?", (uid,))
+                    db.commit()
+                except Exception:
+                    logging.exception("дожим не удался для %s", uid)
+        except Exception:
+            logging.exception("ошибка цикла дожима")
+        await asyncio.sleep(30)
+# ====================== конец блока FUNNEL ======================
 
 
 # ---------- Копии базы (под вашим контролем) ----------
@@ -1364,12 +1617,14 @@ async def stats(m: Message):
     ).fetchone()[0] if AUTOCHARGE else 0
     pending_auto = db.execute("SELECT COUNT(*) FROM pending WHERE is_auto=1").fetchone()[0]
     stuck = db.execute("SELECT COUNT(*) FROM users WHERE active=0 AND pay_started_at IS NOT NULL").fetchone()[0]
+    funnel_done = db.execute("SELECT COUNT(*) FROM funnel_users WHERE done=1").fetchone()[0]
     await m.answer(
         f"Активных подписчиков: {n}\nВсего оплат: {s}\n"
         f"Автосписание включено в настройках: {'да' if AUTOCHARGE else 'нет'}\n"
         f"Активных подписок с автопродлением в текущем магазине: {recurring}\n"
         f"Ожидающих автоплатежей: {pending_auto}\n"
         f"Дошли до оплаты, но не оплатили: {stuck}\n"
+        f"Прошли квалификацию в воронке: {funnel_done}\n"
         f"Файл базы: {os.path.abspath(DB_PATH)}"
     )
 
@@ -1580,6 +1835,7 @@ async def main():
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
     asyncio.create_task(scheduler())
+    asyncio.create_task(funnel_followup_loop())
     await dp.start_polling(bot)
 
 
