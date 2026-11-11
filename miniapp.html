@@ -24,7 +24,21 @@ textarea{resize:none}
 .chips::-webkit-scrollbar{display:none}
 .chip{flex:none;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 12px;font-size:13px;color:var(--hint)}
 .chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
-.row{display:flex;gap:10px;padding:11px 0;border-bottom:1px solid var(--line);align-items:center}
+.row{display:flex;gap:10px;padding:11px 0 11px 10px;border-bottom:1px solid var(--line);border-left:4px solid var(--sc,transparent);align-items:center}
+.row.lost{opacity:.5}.row.lost .ava{filter:grayscale(1)}
+.tag.st{color:var(--sc);border-color:var(--sc)}
+.sumbar{display:flex;gap:8px;overflow-x:auto;padding-bottom:10px;scrollbar-width:none}
+.sumbar .card{flex:none;min-width:92px;border-top:3px solid var(--sc,var(--line))}
+.board{display:flex;gap:10px;overflow-x:auto;scroll-snap-type:x mandatory;margin:0 -14px;padding:0 14px 10px}
+.col{flex:none;width:78vw;max-width:320px;scroll-snap-align:start;background:var(--card);border:1px solid var(--line);border-top:3px solid var(--sc);border-radius:14px;padding:10px;display:flex;flex-direction:column;gap:8px;max-height:calc(100dvh - 230px);overflow-y:auto}
+.col h4{margin:0;display:flex;justify-content:space-between;align-items:center;font-size:14px}
+.col h4 span{color:var(--sc);font-weight:700;font-size:18px}
+.kc{background:var(--bg);border:1px solid var(--line);border-left:4px solid var(--sc);border-radius:10px;padding:8px 10px}
+.kc.lost{opacity:.55}
+.pills{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
+.pill{background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:6px 12px;font-size:13px}
+.pill.on{background:var(--sc,var(--acc));border-color:var(--sc,var(--acc));color:#111;font-weight:600}
+.comp .q .btn{flex:1;padding:8px 6px;font-size:13px}
 .ava{flex:none;width:42px;height:42px;border-radius:50%;background:linear-gradient(135deg,var(--acc),#7a3cff);display:flex;align-items:center;justify-content:center;font-weight:600;color:#fff}
 .rb{flex:1;min-width:0}
 .r1{display:flex;justify-content:space-between;gap:8px}
@@ -78,7 +92,8 @@ h3{margin:18px 0 8px;font-size:15px}
 <div id="top"></div>
 <div id="main"></div>
 <div id="nav">
-  <button data-v="leads" class="on"><b>👥</b>Лиды</button>
+  <button data-v="board" class="on"><b>🗂</b>Воронка</button>
+  <button data-v="leads"><b>👥</b>Лиды</button>
   <button data-v="stats"><b>💰</b>Деньги</button>
   <button data-v="settings"><b>⚙️</b>Настройки</button>
 </div>
@@ -90,10 +105,12 @@ if (tg) { tg.ready(); tg.expand(); }
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const rub = n => Math.round(n || 0).toLocaleString('ru-RU') + ' ₽';
-const STAGES = {new:'Новый', talk:'В диалоге', offer:'Предложил', won:'Оплатил', lost:'Отказ'};
+const STAGES = {entered:'Зашёл в бота', series:'Серия уроков', ready:'Готов к закрытию', won:'Купил подписку', lost:'Не купил / закрыт'};
+const SC = {entered:'#ffc14d', series:'#ffc14d', ready:'#3ddc97', won:'#ff4d94', lost:'#8d8d99'};   // жёлтый, зелёный, розовый, серый
+const ORDER = ['entered','series','ready','won','lost'];
 const SEG = {ready:['🔥','Готов'], interested:['🙂','Тёплый'], cold:['❄️','Холодный']};
-const FILTERS = [['all','Все'],['unread','Новые сообщения'],['hot','🔥 Горячие'],['open','Не оплатили'],['subs','Подписчики']];
-const S = {view:'leads', leads:[], stats:null, price:0, filter:'all', q:'', cur:null, tab:'chat', data:null, lastKey:'', settings:null};
+const FILTERS = [['all','Все'],['unread','Новые сообщения'],['ready','🟢 К закрытию'],['prog','🟡 В процессе'],['won','🩷 Купили'],['lost','⚪ Закрыты']];
+const S = {view:'board', leads:[], stats:null, price:0, filter:'all', q:'', cur:null, tab:'chat', data:null, lastKey:'', settings:null};
 let calc = {price:null, conv:10};
 
 async function api(path, body = {}) {
@@ -118,7 +135,7 @@ function toast(t) { if (tg && tg.showAlert) tg.showAlert(t); else alert(t); }
 document.querySelectorAll('#nav button').forEach(b => b.onclick = () => { S.view = b.dataset.v; render(); });
 function render() {
   document.querySelectorAll('#nav button').forEach(b => b.classList.toggle('on', b.dataset.v === S.view));
-  if (S.view === 'leads') renderLeads(); else if (S.view === 'stats') renderStats(); else renderSettings();
+  if (S.view === 'board') renderBoard(); else if (S.view === 'leads') renderLeads(); else if (S.view === 'stats') renderStats(); else renderSettings();
 }
 async function loadLeads() {
   const d = await api('leads');
@@ -129,9 +146,10 @@ async function loadLeads() {
 /* ---------- список лидов ---------- */
 function passes(l) {
   if (S.filter === 'unread' && !l.unread) return false;
-  if (S.filter === 'hot' && !(l.seg === 'ready' && !l.active)) return false;
-  if (S.filter === 'open' && (l.active || l.stage === 'lost')) return false;
-  if (S.filter === 'subs' && !l.active) return false;
+  if (S.filter === 'ready' && l.stage !== 'ready') return false;
+  if (S.filter === 'prog' && l.stage !== 'entered' && l.stage !== 'series') return false;
+  if (S.filter === 'won' && l.stage !== 'won') return false;
+  if (S.filter === 'lost' && l.stage !== 'lost') return false;
   const q = S.q.trim().toLowerCase();
   return !q || (l.name + ' ' + (l.username || '') + ' ' + l.id).toLowerCase().includes(q);
 }
@@ -144,23 +162,48 @@ function renderLeads() {
   $('#main').innerHTML = '<div id="rows"></div>';
   drawRows();
 }
+const RANK = {ready:0, series:1, entered:2, won:3, lost:9};
+const act = l => l.last ? l.last.ts : l.joined || 0;
+// закрытые («не купил») всегда в самом низу; выше: с новыми сообщениями, потом по стадии, потом по свежести
+const cmpLeads = (a, b) => (a.stage === 'lost') - (b.stage === 'lost') || (b.unread > 0) - (a.unread > 0) || RANK[a.stage] - RANK[b.stage] || act(b) - act(a);
 function drawRows() {
-  const list = S.leads.filter(passes).sort((a, b) =>
-    (b.unread > 0) - (a.unread > 0) || ((b.last ? b.last.ts : b.joined || 0) - (a.last ? a.last.ts : a.joined || 0)));
+  const list = S.leads.filter(passes).sort(cmpLeads);
   $('#rows').innerHTML = list.length ? list.map(l => {
-    const tags = [];
-    if (l.active) tags.push(`<span class="tag ok">✅ до ${esc(l.expires)}${l.days_left <= 7 ? ' · ' + l.days_left + ' дн.' : ''}</span>`);
-    else tags.push(`<span class="tag ${l.stage === 'lost' ? 'bad' : 'warn'}">${STAGES[l.stage]}</span>`);
+    const tags = [`<span class="tag st">${STAGES[l.stage]}</span>`];
+    if (l.active) tags.push(`<span class="tag">до ${esc(l.expires)}${l.days_left <= 7 ? ' · ' + l.days_left + ' дн.' : ''}</span>`);
     if (l.seg) tags.push(`<span class="tag">${SEG[l.seg][0]} ${SEG[l.seg][1]}</span>`);
     else if (l.funnel) tags.push('<span class="tag">тест не закончен</span>');
     if (l.blocked) tags.push('<span class="tag bad">заблокирован</span>');
     const prev = l.last ? (l.last.dir === 'out' ? 'Вы: ' : '') + l.last.text : 'Сообщений пока нет';
-    return `<div class="row" data-id="${l.id}"><div class="ava">${esc((l.name || '?').trim().charAt(0).toUpperCase())}</div>
+    return `<div class="row ${l.stage === 'lost' ? 'lost' : ''}" style="--sc:${SC[l.stage]}" data-id="${l.id}"><div class="ava">${esc((l.name || '?').trim().charAt(0).toUpperCase())}</div>
       <div class="rb"><div class="r1"><b>${esc(l.name)}</b><span class="time">${l.last ? fmtTime(l.last.ts) : ''}</span></div>
       <div class="r2">${esc(prev)}</div><div class="tags">${tags.join('')}</div></div>
       ${l.unread ? `<div class="badge">${l.unread}</div>` : ''}</div>`;
   }).join('') : '<div class="empty">Никого не найдено</div>';
   document.querySelectorAll('.row').forEach(r => r.onclick = () => openLead(+r.dataset.id));
+}
+
+/* ---------- воронка (канбан) ---------- */
+function renderBoard() {
+  const sx = $('.board') ? $('.board').scrollLeft : 0, sy = [...document.querySelectorAll('.col')].map(c => c.scrollTop);
+  $('#top').innerHTML = '';
+  const by = k => S.leads.filter(l => l.stage === k).sort(cmpLeads);
+  const unread = S.leads.reduce((n, l) => n + (l.unread ? 1 : 0), 0);
+  $('#main').innerHTML = `<div class="sumbar"><div class="card"><small>Всего лидов</small><strong>${S.leads.length}</strong>${unread ? `<small style="color:var(--acc)">✉ ${unread} с новыми</small>` : ''}</div>` +
+    ORDER.map(k => `<div class="card" style="--sc:${SC[k]}"><small>${STAGES[k]}</small><strong>${by(k).length}</strong></div>`).join('') + '</div>' +
+    '<div class="board">' + ORDER.map(k => {
+      const items = by(k);
+      return `<div class="col" style="--sc:${SC[k]}"><h4>${STAGES[k]}<span>${items.length}</span></h4>` +
+        (items.map(l => {
+          const prev = l.last ? (l.last.dir === 'out' ? 'Вы: ' : '') + l.last.text : 'Сообщений пока нет';
+          const seg = l.seg ? `<span class="tag">${SEG[l.seg][0]} ${SEG[l.seg][1]}</span>` : '';
+          const sub = l.active ? `<span class="tag">до ${esc(l.expires)}</span>` : '';
+          return `<div class="kc ${k === 'lost' ? 'lost' : ''}" style="--sc:${SC[k]}" data-id="${l.id}"><div class="r1"><b>${esc(l.name)}</b>${l.unread ? `<span class="badge">${l.unread}</span>` : ''}</div>
+            <div class="r2">${esc(prev)}</div><div class="tags">${seg}${sub}</div></div>`;
+        }).join('') || '<div class="hint">Пусто</div>') + '</div>';
+    }).join('') + '</div>';
+  document.querySelectorAll('.kc').forEach(c => c.onclick = () => openLead(+c.dataset.id));
+  const b = $('.board'); b.scrollLeft = sx; document.querySelectorAll('.col').forEach((c, i) => c.scrollTop = sy[i] || 0);
 }
 
 /* ---------- деньги ---------- */
@@ -183,7 +226,7 @@ function renderStats() {
     <div class="card"><small>Потенциал (оценка)</small><strong>${rub(s.potential)}</strong></div>
     <div class="card"><small>Если оплатят все</small><strong>${rub(s.potential_all)}</strong></div>
   </div>
-  <p class="hint">Открытых лидов (не оплатили, не отказались): ${s.open}. Оценка считается по сегменту теста и этапу сделки, вероятности в bot.py (CRM_PROB_SEG, CRM_PROB_STAGE). Выручка считается как число оплат × цена (${rub(S.price)}).</p>
+  <p class="hint">Открытых лидов (ещё не купили и не закрыты): ${s.open}. Оценка считается по стадии воронки, вероятности в bot.py (CRM_PROB_STAGE). Выручка считается как число оплат × цена (${rub(S.price)}).</p>
   <h3>По сегментам теста</h3>
   <div class="grid">
     <div class="card"><small>🔥 Готовы</small><strong>${s.seg.ready}</strong></div>
@@ -241,13 +284,17 @@ function buildLead() {
   const l = S.data.lead;
   $('#lead').innerHTML = `
   <div class="lh"><button class="btn ghost" id="bk">‹</button><div class="rb"><b>${esc(l.name)}</b>
-    <div class="hint">${l.username ? '@' + esc(l.username) + ' · ' : ''}id ${l.id}</div></div>
+    <div class="hint">${l.username ? '@' + esc(l.username) + ' · ' : ''}id ${l.id} <span class="tag st" id="hs" style="--sc:${SC[l.stage]}">${STAGES[l.stage]}</span></div></div>
     <a class="btn ghost" href="${l.username ? 'https://t.me/' + esc(l.username) : 'tg://user?id=' + l.id}" style="text-decoration:none">Telegram</a></div>
   <div class="lt"><button data-t="chat">Чат</button><button data-t="profile">Профиль</button><button data-t="notes">Заметки</button></div>
   <div class="lbody" id="lb"></div><div id="cmp"></div>`;
   $('#bk').onclick = closeLead;
   document.querySelectorAll('.lt button').forEach(b => b.onclick = () => { S.tab = b.dataset.t; drawLead(true); });
   drawLead(true);
+}
+function updHead() {
+  const l = S.data.lead, h = $('#hs'); if (!h) return;
+  h.textContent = STAGES[l.stage]; h.style.setProperty('--sc', SC[l.stage]);
 }
 function drawLead(force) {
   document.querySelectorAll('.lt button').forEach(b => b.classList.toggle('on', b.dataset.t === S.tab));
@@ -263,15 +310,24 @@ function drawChat(force) {
     : '<div class="empty">Переписки пока нет</div>';
   if (nearBottom) lb.scrollTop = lb.scrollHeight;
   if (!$('#ta')) {
-    $('#cmp').innerHTML = `<div class="comp"><div class="q"><button class="btn ghost" id="pay">💳 Отправить форму оплаты</button></div>
+    $('#cmp').innerHTML = `<div class="comp"><div class="q"><button class="btn ghost" id="pay">💳 Оплата</button><button class="btn ghost" id="bought">✅ Купил</button><button class="btn ghost" id="lostb">✖ Не купил</button></div>
       <div class="rr"><textarea id="ta" rows="1" placeholder="Сообщение лиду…"></textarea><button class="btn" id="snd">➤</button></div><div class="err" id="er"></div></div>`;
     const ta = $('#ta');
     ta.oninput = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 120) + 'px'; };
     $('#snd').onclick = send;
+    $('#bought').onclick = () => setStage('won');
+    $('#lostb').onclick = () => setStage('lost');
     $('#pay').onclick = async () => {
       const r = await api('pay', {id:S.cur}); $('#er').textContent = r.ok ? '' : r.error; if (r.ok) refreshLead();
     };
   }
+}
+async function setStage(k) {
+  const a = $('#am') ? $('#am').value : (S.data.lead.amount ?? '');
+  const r = await api('stage', {id:S.cur, stage:k, amount:a});
+  if (!r.ok) return toast(r.error);
+  await refreshLead(true);
+  if (S.tab === 'profile') drawProfile();
 }
 async function send() {
   const ta = $('#ta'), text = ta.value.trim(); if (!text) return;
@@ -284,30 +340,32 @@ async function refreshLead(force) {
   if (!S.cur) return;
   const id = S.cur, d = await api('lead', {id, light:true});
   if (S.cur !== id) return;
-  S.data.messages = d.messages; S.data.notes = d.notes; S.data.lead = d.lead;
+  S.data.messages = d.messages; S.data.notes = d.notes; S.data.lead = d.lead; updHead();
   if (S.tab === 'chat') drawChat(force); else if (S.tab === 'notes') drawNotes();
 }
 function drawProfile() {
   const d = S.data, l = d.lead, p = d.profile;
   $('#lb').innerHTML = `
   <div class="card">
-    <small class="hint">Этап сделки</small>
-    <select id="st">${Object.entries(STAGES).map(([k, v]) => `<option value="${k}" ${l.stage === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+    <small class="hint">Стадия (нажмите, чтобы поменять)</small>
+    <div class="pills" id="stp">${[['auto','Авто']].concat(Object.entries(STAGES)).map(([k, v]) => `<button class="pill ${(l.override ? l.stage : 'auto') === k ? 'on' : ''}" data-k="${k}" style="--sc:${SC[k] || 'var(--acc)'}">${v}</button>`).join('')}</div>
+    <div class="hint" style="margin-top:6px">${l.override ? 'Поставлено вручную.' : 'Определяется автоматически: «' + STAGES[l.auto_stage] + '».'}</div>
     <small class="hint" style="margin-top:10px">Ожидаемая сумма, ₽ (пусто = цена подписки ${rub(S.price)})</small>
     <input type="number" id="am" inputmode="decimal" value="${l.amount ?? ''}">
-    <button class="btn" id="sv" style="margin-top:10px">Сохранить</button>
-    <div class="hint" style="margin-top:6px">${l.active ? 'Сейчас идёт подписка до ' + esc(l.expires) + ', этап «Оплатил» ставится автоматически.' : ''}</div>
+    <button class="btn" id="sv" style="margin-top:10px">Сохранить сумму</button>
+    <div class="hint" style="margin-top:6px">${l.active ? 'Сейчас идёт подписка до ' + esc(l.expires) + ', стадия «Купил подписку» ставится автоматически.' : ''}</div>
   </div>
   <h3>Профиль из теста</h3>` + (p ? `
     ${p.segment ? `<div class="card"><b>${esc(p.segment)}</b><div class="hint">Рекомендуемый продукт: ${esc(p.product)}<br>Направление: ${esc(p.direction)}<br>Доп. проблемы: ${esc(p.problems)}</div></div>` : `<div class="hint">Тест не завершён, этап: ${esc(p.stage)}</div>`}
     <div class="hint" style="margin-top:8px">Источник: ${esc(p.source || '—')}</div>
     ${p.qa.map(x => `<div class="qa"><small>${esc(x.q)}</small>${esc(x.a)}</div>`).join('')}
     ${p.resume ? `<h3>Резюме</h3><div class="card">${esc(p.resume)}</div>` : ''}` : '<div class="hint">Этот человек не проходил воронку из Instagram.</div>');
+  document.querySelectorAll('#stp .pill').forEach(p => p.onclick = () => setStage(p.dataset.k));
   $('#sv').onclick = async () => {
-    const r = await api('stage', {id:S.cur, stage:$('#st').value, amount:$('#am').value});
+    const r = await api('stage', {id:S.cur, stage:l.override ? l.stage : 'auto', amount:$('#am').value});
     if (!r.ok) return toast(r.error);
-    $('#sv').textContent = 'Сохранено ✓'; setTimeout(() => { const b = $('#sv'); if (b) b.textContent = 'Сохранить'; }, 1200);
-    S.data.lead.stage = $('#st').value; S.data.lead.amount = $('#am').value ? +$('#am').value : null;
+    $('#sv').textContent = 'Сохранено ✓'; setTimeout(() => { const b = $('#sv'); if (b) b.textContent = 'Сохранить сумму'; }, 1200);
+    S.data.lead.amount = $('#am').value ? +$('#am').value : null;
   };
 }
 function drawNotes() {
@@ -336,7 +394,7 @@ function drawNotes() {
 })();
 setInterval(() => { if (document.hidden) return;
   if (S.cur) refreshLead().catch(() => {});
-  else if (S.view === 'leads' || S.view === 'stats') loadLeads().then(() => { if (S.view === 'stats' && !document.activeElement.matches('input')) render(); else if (S.view === 'leads') drawRows(); }).catch(() => {});
+  else loadLeads().then(() => { if (S.view === 'board') renderBoard(); else if (S.view === 'stats' && !document.activeElement.matches('input')) renderStats(); else if (S.view === 'leads') drawRows(); }).catch(() => {});
 }, 6000);
 </script>
 </body>

@@ -181,6 +181,10 @@ def migrate():
         db.execute("ALTER TABLE funnel_users ADD COLUMN stage TEXT DEFAULT 'group'")
     if "tmp" not in funnel_cols:
         db.execute("ALTER TABLE funnel_users ADD COLUMN tmp TEXT DEFAULT '[]'")
+    if "done_at" not in funnel_cols:  # когда закончил тест (0 = старые лиды: серия им не шлётся)
+        db.execute("ALTER TABLE funnel_users ADD COLUMN done_at INTEGER DEFAULT 0")
+    if "series_idx" not in funnel_cols:  # сколько писем серии уже отправлено
+        db.execute("ALTER TABLE funnel_users ADD COLUMN series_idx INTEGER DEFAULT 0")
     db.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('payment_store_mode',?)", (PAYMENT_STORE_MODE,))
     db.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('maintenance_mode','1')")
     db.execute(
@@ -942,7 +946,7 @@ def funnel_reset(uid: int, source: str):
     db.execute("""INSERT INTO funnel_users(user_id, source, answers, stage, step, tmp, done, created)
                   VALUES(?,?,'{}','group',0,'[]',0,?)
                   ON CONFLICT(user_id) DO UPDATE SET source=excluded.source, answers='{}',
-                    stage='group', step=0, tmp='[]', done=0""",
+                    stage='group', step=0, tmp='[]', done=0, done_at=0, series_idx=0""",
                (uid, source, int(time.time())))
     db.commit()
 
@@ -1028,10 +1032,20 @@ async def funnel_build_card(uid: int):
 
 
 # ---------- Мини-апп CRM: настройки и переключатель топиков ----------
-CRM_STAGES = {"new": "Новый", "talk": "В диалоге", "offer": "Предложил", "won": "Оплатил", "lost": "Отказ"}
-# Вероятность оплаты для оценки «потенциальной прибыли». Правьте под себя.
-CRM_PROB_SEG = {"ready": 0.5, "interested": 0.2, "cold": 0.05, None: 0.1}   # стадия «Новый»: по сегменту теста
-CRM_PROB_STAGE = {"talk": 0.35, "offer": 0.6, "won": 0.3, "lost": 0.0}      # «Оплатил», но подписка закончилась = шанс вернуть
+# Стадии воронки. Определяются сами; в карточке лида стадию можно поставить вручную («Авто» возвращает автоматику).
+CRM_STAGES = {"entered": "Зашёл в бота", "series": "Серия уроков", "ready": "Готов к закрытию",
+              "won": "Купил подписку", "lost": "Не купил / закрыт"}
+# Вероятность оплаты по стадиям для оценки «потенциальной прибыли». Правьте под свою реальную конверсию.
+CRM_PROB_STAGE = {"entered": 0.05, "series": 0.2, "ready": 0.5}
+
+# ---------- СЕРИЯ УРОКОВ ----------
+# Письма, которые бот сам присылает после того, как человек прошёл квалификацию (тест).
+# Формат: (через сколько дней после теста, текст). 0 = сразу. Разметка: <b>жирный</b>, <i>курсив</i>.
+# Пока список пустой: стадия «Серия уроков» заканчивается сразу после теста и человек
+# попадает в «Готов к закрытию». Добавьте письма, например:
+#   (1, "📩 <b>Урок 2.</b> Текст письма..."),
+#   (3, "📩 <b>Урок 3.</b> Текст письма..."),
+FUNNEL_SERIES: list[tuple[float, str]] = []
 
 
 def crm_topics_on() -> bool:
@@ -1119,7 +1133,7 @@ async def funnel_card_to_admin(uid: int):
 
 
 async def funnel_finish(uid: int):
-    funnel_update(uid, stage="done", done=1, tmp="[]")
+    funnel_update(uid, stage="done", done=1, tmp="[]", done_at=int(time.time()), series_idx=0)
     await bot.send_message(uid, FUNNEL_THANKS)
     existed = crm_topics_on() and db.execute(
         "SELECT 1 FROM crm_topics WHERE user_id=?", (uid,)).fetchone() is not None
@@ -2301,6 +2315,31 @@ async def check_daily_report():
     db.commit()
 
 
+async def check_series():
+    """Серия уроков: после теста бот сам присылает письма по расписанию FUNNEL_SERIES."""
+    if not FUNNEL_SERIES:
+        return
+    t = int(time.time())
+    for f in db.execute("SELECT user_id, done_at, series_idx FROM funnel_users "
+                        "WHERE done=1 AND done_at>0 AND series_idx<?", (len(FUNNEL_SERIES),)).fetchall():
+        uid, idx = f["user_id"], f["series_idx"]
+        days, text = FUNNEL_SERIES[idx]
+        if t < f["done_at"] + days * 86400:
+            continue
+        blocked = db.execute("SELECT blocked FROM users WHERE user_id=?", (uid,)).fetchone()
+        if active_subscription(uid) or (blocked and blocked["blocked"]):  # купил или заблокирован: серию заканчиваем
+            db.execute("UPDATE funnel_users SET series_idx=? WHERE user_id=?", (len(FUNNEL_SERIES), uid))
+            db.commit()
+            continue
+        db.execute("UPDATE funnel_users SET series_idx=series_idx+1 WHERE user_id=?", (uid,))
+        db.commit()
+        await safe_send(uid, text)
+        db.execute("INSERT INTO crm_messages(user_id, direction, text, ts) VALUES(?,?,?,?)",
+                   (uid, "out", f"[урок серии {idx + 1}] " + text, int(time.time())))
+        db.commit()
+        await crm_notify(uid, f"📚 Отправлен урок серии {idx + 1} из {len(FUNNEL_SERIES)}.")
+
+
 async def scheduler():
     while True:
         try:
@@ -2309,6 +2348,7 @@ async def scheduler():
                 await check_pending()
                 await check_pending_methods()
             await check_stuck()
+            await check_series()
             await check_backup()
             await check_subscriptions()
         except Exception:
@@ -2369,18 +2409,33 @@ def crm_seg(f):
     return funnel_segment(funnel_answers(f)) if f and f["done"] else None
 
 
+def crm_auto_stage(active: bool, f) -> str:
+    """Стадия по фактам: вход -> серия уроков (вместе с тестом) -> готов к закрытию -> купил."""
+    if active:
+        return "won"
+    if not f or f["stage"] == "group":
+        return "entered"
+    if not f["done"]:
+        return "series"
+    if f["done_at"] and f["series_idx"] < len(FUNNEL_SERIES):
+        return "series"
+    return "ready"
+
+
 def crm_build(uid, u, f, name, lead, last, unread) -> dict:
     active = crm_is_active(u)
     seg = crm_seg(f)
     username = u["username"] if u else None
-    stage = "won" if active else (lead["stage"] if lead else "new")
+    auto = crm_auto_stage(active, f)
+    manual = lead["stage"] if lead and lead["stage"] in CRM_STAGES else None
+    stage = "won" if active else (manual or auto)
     exp_ts = _ts(u["expires_at"]) if u and u["expires_at"] else None
     days_left = math.ceil((exp_ts - time.time()) / 86400) if (active and exp_ts) else None
     joined = _ts(u["joined_at"]) if u and u["joined_at"] else (f["created"] if f else None)
     return {
         "id": uid, "name": name or (f"@{username}" if username else str(uid)), "username": username,
         "seg": seg, "active": active, "expires": fmt(datetime.fromisoformat(u["expires_at"])) if exp_ts else None,
-        "days_left": days_left, "stage": stage, "amount": lead["amount"] if lead and lead["amount"] else None,
+        "days_left": days_left, "stage": stage, "override": bool(manual and not active), "auto_stage": auto, "amount": lead["amount"] if lead and lead["amount"] else None,
         "blocked": bool(u and u["blocked"]), "joined": joined,
         "source": f["source"] if f else None,
         "funnel": ("done" if f and f["done"] else (f["stage"] if f else None)),
@@ -2450,12 +2505,11 @@ async def api_leads(data):
 
     t = time.time()
     day0 = t - t % 86400
-    open_leads = [l for l in out if not l["active"] and not l["blocked"] and l["stage"] != "lost"]
+    open_leads = [l for l in out if not l["active"] and not l["blocked"] and l["stage"] in CRM_PROB_STAGE]
     potential_all = sum(l["amount"] or PRICE for l in open_leads)
     weighted = 0.0
     for l in open_leads:
-        p = CRM_PROB_SEG.get(l["seg"], CRM_PROB_SEG[None]) if l["stage"] == "new" else CRM_PROB_STAGE.get(l["stage"], 0.1)
-        weighted += (l["amount"] or PRICE) * p
+        weighted += (l["amount"] or PRICE) * CRM_PROB_STAGE[l["stage"]]
     pay_total = db.execute("SELECT COUNT(*) FROM payments").fetchone()[0]
     pay_30 = db.execute("SELECT COUNT(*) FROM payments WHERE created>=?",
                         (iso(now() - timedelta(days=30)),)).fetchone()[0]
@@ -2469,6 +2523,7 @@ async def api_leads(data):
         "revenue": pay_total * PRICE, "revenue_30": pay_30 * PRICE, "payments": pay_total,
         "mrr": sum(1 for l in out if l["active"]) * PRICE * 30 / PERIOD_DAYS,
         "seg": {k: sum(1 for l in out if l["seg"] == k) for k in ("ready", "interested", "cold")},
+        "stages": {k: sum(1 for l in out if l["stage"] == k) for k in CRM_STAGES},
     }
     return {"leads": out, "stats": stats, "price": PRICE}
 
@@ -2544,8 +2599,8 @@ async def api_note_del(data):
 
 async def api_stage(data):
     uid, stage = int(data["id"]), data.get("stage")
-    if stage not in CRM_STAGES:
-        return {"ok": False, "error": "Неизвестный этап"}
+    if stage != "auto" and stage not in CRM_STAGES:
+        return {"ok": False, "error": "Неизвестная стадия"}
     try:
         amount = float(data["amount"]) if data.get("amount") not in (None, "") else None
     except (TypeError, ValueError):
