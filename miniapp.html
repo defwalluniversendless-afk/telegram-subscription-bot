@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>CRM</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:var(--tg-theme-bg-color,#0c0c0f);--tx:var(--tg-theme-text-color,#f4f4f6);--hint:var(--tg-theme-hint-color,#8d8d99);
+--card:var(--tg-theme-secondary-bg-color,#17171c);--acc:#ff4d94;--line:rgba(127,127,140,.22);--ok:#3ddc97;--warn:#ffc14d;--bad:#ff6b6b}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--tx);font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column;overflow:hidden}
+button,input,select,textarea{font:inherit;color:inherit}
+#top{padding:10px 14px 0;flex:none}
+#main{flex:1;overflow-y:auto;padding:10px 14px 16px;-webkit-overflow-scrolling:touch}
+#nav{flex:none;display:flex;border-top:1px solid var(--line);background:var(--bg);padding-bottom:env(safe-area-inset-bottom)}
+#nav button{flex:1;background:none;border:0;padding:10px 0 8px;color:var(--hint);font-size:12px}
+#nav button b{display:block;font-size:19px;font-weight:400}
+#nav button.on{color:var(--acc)}
+input[type=search],input[type=number],input[type=text],select,textarea{width:100%;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;outline:none}
+textarea{resize:none}
+.chips{display:flex;gap:6px;overflow-x:auto;padding:8px 0;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:none;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 12px;font-size:13px;color:var(--hint)}
+.chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.row{display:flex;gap:10px;padding:11px 0;border-bottom:1px solid var(--line);align-items:center}
+.ava{flex:none;width:42px;height:42px;border-radius:50%;background:linear-gradient(135deg,var(--acc),#7a3cff);display:flex;align-items:center;justify-content:center;font-weight:600;color:#fff}
+.rb{flex:1;min-width:0}
+.r1{display:flex;justify-content:space-between;gap:8px}
+.r1 b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.time{color:var(--hint);font-size:12px;flex:none}
+.r2{color:var(--hint);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tags{display:flex;gap:5px;margin-top:3px;flex-wrap:wrap}
+.tag{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--card);border:1px solid var(--line);color:var(--hint)}
+.tag.ok{color:var(--ok);border-color:var(--ok)}.tag.warn{color:var(--warn);border-color:var(--warn)}.tag.bad{color:var(--bad);border-color:var(--bad)}
+.badge{flex:none;background:var(--acc);color:#fff;border-radius:999px;min-width:22px;height:22px;padding:0 6px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}
+.card small{color:var(--hint);display:block;font-size:12px}
+.card strong{font-size:20px}
+.card.wide{grid-column:1/3}
+h3{margin:18px 0 8px;font-size:15px}
+.hint{color:var(--hint);font-size:13px}
+.btn{background:var(--acc);color:#fff;border:0;border-radius:12px;padding:10px 14px;font-weight:600}
+.btn.ghost{background:var(--card);color:var(--tx);border:1px solid var(--line)}
+.btn:disabled{opacity:.5}
+#lead{position:fixed;inset:0;background:var(--bg);z-index:5;display:none;flex-direction:column}
+#lead.on{display:flex}
+.lh{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center}
+.lh .rb b{font-size:16px}
+.lt{display:flex;border-bottom:1px solid var(--line)}
+.lt button{flex:1;background:none;border:0;padding:10px 0;color:var(--hint);border-bottom:2px solid transparent}
+.lt button.on{color:var(--acc);border-color:var(--acc)}
+.lbody{flex:1;overflow-y:auto;padding:12px 14px}
+.msgs{display:flex;flex-direction:column;gap:6px}
+.m{max-width:82%;padding:8px 11px;border-radius:16px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
+.m.in{background:var(--card);border:1px solid var(--line);align-self:flex-start;border-bottom-left-radius:5px}
+.m.out{background:var(--acc);color:#fff;align-self:flex-end;border-bottom-right-radius:5px}
+.m i{display:block;font-style:normal;font-size:10px;opacity:.6;margin-top:2px;text-align:right}
+.comp{flex:none;border-top:1px solid var(--line);padding:8px 12px calc(8px + env(safe-area-inset-bottom));background:var(--bg)}
+.comp .rr{display:flex;gap:8px;align-items:flex-end}
+.comp textarea{max-height:120px}
+.comp .q{display:flex;gap:6px;margin-bottom:6px}
+.qa{padding:9px 0;border-bottom:1px solid var(--line)}
+.qa small{color:var(--hint);display:block;font-size:12px}
+.note{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-top:8px;white-space:pre-wrap;overflow-wrap:anywhere}
+.note small{display:flex;justify-content:space-between;color:var(--hint);margin-top:4px}
+.note small a{color:var(--bad)}
+.sw{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.sw input{width:46px;height:26px;accent-color:var(--acc)}
+.empty{text-align:center;color:var(--hint);padding:40px 10px}
+.err{color:var(--bad);font-size:13px;margin-top:6px}
+.line2{display:flex;gap:8px}
+</style>
+</head>
+<body>
+<div id="top"></div>
+<div id="main"></div>
+<div id="nav">
+  <button data-v="leads" class="on"><b>👥</b>Лиды</button>
+  <button data-v="stats"><b>💰</b>Деньги</button>
+  <button data-v="settings"><b>⚙️</b>Настройки</button>
+</div>
+<div id="lead"></div>
+
+<script>
+const tg = window.Telegram && Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const rub = n => Math.round(n || 0).toLocaleString('ru-RU') + ' ₽';
+const STAGES = {new:'Новый', talk:'В диалоге', offer:'Предложил', won:'Оплатил', lost:'Отказ'};
+const SEG = {ready:['🔥','Готов'], interested:['🙂','Тёплый'], cold:['❄️','Холодный']};
+const FILTERS = [['all','Все'],['unread','Новые сообщения'],['hot','🔥 Горячие'],['open','Не оплатили'],['subs','Подписчики']];
+const S = {view:'leads', leads:[], stats:null, price:0, filter:'all', q:'', cur:null, tab:'chat', data:null, lastKey:'', settings:null};
+let calc = {price:null, conv:10};
+
+async function api(path, body = {}) {
+  const r = await fetch('/api/' + path, {method:'POST', headers:{'Content-Type':'application/json','X-Init-Data':(tg && tg.initData) || ''}, body:JSON.stringify(body)});
+  if (r.status === 401) { authError(); throw new Error('auth'); }
+  if (!r.ok) throw new Error('http ' + r.status);
+  return r.json();
+}
+function authError() {
+  document.body.innerHTML = '<div class="empty" style="margin:auto">🔒 Доступ только администратору.<br>Откройте CRM из бота (кнопка «CRM» или команда /app).<br>Если окно давно открыто, закройте и откройте заново.</div>';
+}
+function fmtTime(ts) {
+  const d = new Date(ts * 1000), n = new Date();
+  return d.toDateString() === n.toDateString()
+    ? d.toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'})
+    : d.toLocaleDateString('ru-RU', {day:'2-digit', month:'2-digit'});
+}
+const fmtFull = ts => new Date(ts * 1000).toLocaleString('ru-RU', {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'});
+function toast(t) { if (tg && tg.showAlert) tg.showAlert(t); else alert(t); }
+
+/* ---------- навигация ---------- */
+document.querySelectorAll('#nav button').forEach(b => b.onclick = () => { S.view = b.dataset.v; render(); });
+function render() {
+  document.querySelectorAll('#nav button').forEach(b => b.classList.toggle('on', b.dataset.v === S.view));
+  if (S.view === 'leads') renderLeads(); else if (S.view === 'stats') renderStats(); else renderSettings();
+}
+async function loadLeads() {
+  const d = await api('leads');
+  S.leads = d.leads; S.stats = d.stats; S.price = d.price;
+  if (calc.price === null) calc.price = d.price;
+}
+
+/* ---------- список лидов ---------- */
+function passes(l) {
+  if (S.filter === 'unread' && !l.unread) return false;
+  if (S.filter === 'hot' && !(l.seg === 'ready' && !l.active)) return false;
+  if (S.filter === 'open' && (l.active || l.stage === 'lost')) return false;
+  if (S.filter === 'subs' && !l.active) return false;
+  const q = S.q.trim().toLowerCase();
+  return !q || (l.name + ' ' + (l.username || '') + ' ' + l.id).toLowerCase().includes(q);
+}
+function renderLeads() {
+  $('#top').innerHTML = '<input type="search" id="q" placeholder="Поиск по имени, @нику, id"><div class="chips">' +
+    FILTERS.map(f => `<button class="chip ${S.filter === f[0] ? 'on' : ''}" data-f="${f[0]}">${f[1]}</button>`).join('') + '</div>';
+  $('#q').value = S.q;
+  $('#q').oninput = e => { S.q = e.target.value; drawRows(); };
+  document.querySelectorAll('.chip').forEach(c => c.onclick = () => { S.filter = c.dataset.f; renderLeads(); });
+  $('#main').innerHTML = '<div id="rows"></div>';
+  drawRows();
+}
+function drawRows() {
+  const list = S.leads.filter(passes).sort((a, b) =>
+    (b.unread > 0) - (a.unread > 0) || ((b.last ? b.last.ts : b.joined || 0) - (a.last ? a.last.ts : a.joined || 0)));
+  $('#rows').innerHTML = list.length ? list.map(l => {
+    const tags = [];
+    if (l.active) tags.push(`<span class="tag ok">✅ до ${esc(l.expires)}${l.days_left <= 7 ? ' · ' + l.days_left + ' дн.' : ''}</span>`);
+    else tags.push(`<span class="tag ${l.stage === 'lost' ? 'bad' : 'warn'}">${STAGES[l.stage]}</span>`);
+    if (l.seg) tags.push(`<span class="tag">${SEG[l.seg][0]} ${SEG[l.seg][1]}</span>`);
+    else if (l.funnel) tags.push('<span class="tag">тест не закончен</span>');
+    if (l.blocked) tags.push('<span class="tag bad">заблокирован</span>');
+    const prev = l.last ? (l.last.dir === 'out' ? 'Вы: ' : '') + l.last.text : 'Сообщений пока нет';
+    return `<div class="row" data-id="${l.id}"><div class="ava">${esc((l.name || '?').trim().charAt(0).toUpperCase())}</div>
+      <div class="rb"><div class="r1"><b>${esc(l.name)}</b><span class="time">${l.last ? fmtTime(l.last.ts) : ''}</span></div>
+      <div class="r2">${esc(prev)}</div><div class="tags">${tags.join('')}</div></div>
+      ${l.unread ? `<div class="badge">${l.unread}</div>` : ''}</div>`;
+  }).join('') : '<div class="empty">Никого не найдено</div>';
+  document.querySelectorAll('.row').forEach(r => r.onclick = () => openLead(+r.dataset.id));
+}
+
+/* ---------- деньги ---------- */
+function renderStats() {
+  $('#top').innerHTML = '';
+  const s = S.stats;
+  if (!s) { $('#main').innerHTML = '<div class="empty">Загрузка…</div>'; return; }
+  const projected = () => s.open * (+calc.price || 0) * (+calc.conv || 0) / 100;
+  $('#main').innerHTML = `
+  <div class="grid">
+    <div class="card"><small>Всего людей</small><strong>${s.users}</strong></div>
+    <div class="card"><small>Прошли воронку</small><strong>${s.funnel}</strong></div>
+    <div class="card"><small>Подписчиков</small><strong>${s.active}</strong></div>
+    <div class="card"><small>Истекают за 7 дн.</small><strong>${s.expiring}</strong></div>
+    <div class="card"><small>Новых сегодня</small><strong>${s.new_today}</strong></div>
+    <div class="card"><small>Новых за 7 дней</small><strong>${s.new_week}</strong></div>
+    <div class="card"><small>Выручка за 30 дней ≈</small><strong>${rub(s.revenue_30)}</strong></div>
+    <div class="card"><small>Выручка всего ≈</small><strong>${rub(s.revenue)}</strong></div>
+    <div class="card wide"><small>Регулярный доход в месяц (подписчики × цена)</small><strong>${rub(s.mrr)}</strong></div>
+    <div class="card"><small>Потенциал (оценка)</small><strong>${rub(s.potential)}</strong></div>
+    <div class="card"><small>Если оплатят все</small><strong>${rub(s.potential_all)}</strong></div>
+  </div>
+  <p class="hint">Открытых лидов (не оплатили, не отказались): ${s.open}. Оценка считается по сегменту теста и этапу сделки, вероятности в bot.py (CRM_PROB_SEG, CRM_PROB_STAGE). Выручка считается как число оплат × цена (${rub(S.price)}).</p>
+  <h3>По сегментам теста</h3>
+  <div class="grid">
+    <div class="card"><small>🔥 Готовы</small><strong>${s.seg.ready}</strong></div>
+    <div class="card"><small>🙂 Тёплые</small><strong>${s.seg.interested}</strong></div>
+    <div class="card"><small>❄️ Холодные</small><strong>${s.seg.cold}</strong></div>
+  </div>
+  <h3>Калькулятор</h3>
+  <div class="card">
+    <div class="line2"><div style="flex:1"><small class="hint">Цена, ₽</small><input type="number" id="cp" inputmode="decimal" value="${calc.price}"></div>
+    <div style="flex:1"><small class="hint">Конверсия, %</small><input type="number" id="cc" inputmode="decimal" value="${calc.conv}"></div></div>
+    <p style="margin:10px 0 0">Открытых лидов × цена × конверсия = <b id="cr">${rub(projected())}</b></p>
+  </div>`;
+  const upd = () => { calc.price = $('#cp').value; calc.conv = $('#cc').value; $('#cr').textContent = rub(projected()); };
+  $('#cp').oninput = upd; $('#cc').oninput = upd;
+}
+
+/* ---------- настройки ---------- */
+async function renderSettings() {
+  $('#top').innerHTML = '';
+  $('#main').innerHTML = '<div class="empty">Загрузка…</div>';
+  S.settings = await api('settings');
+  const st = S.settings;
+  $('#main').innerHTML = `
+  <div class="card"><div class="sw"><div><b>CRM в топиках</b><div class="hint">${st.topics_available
+    ? (st.topics_on ? 'Включена: на каждого лида создаётся тема в группе.' : 'Выключена: сообщения лидов приходят уведомлением в личку, работа в этом приложении.')
+    : 'Не настроена: в переменных бота нет CRM_CHAT_ID.'}</div></div>
+    <input type="checkbox" id="tp" ${st.topics_on ? 'checked' : ''} ${st.topics_available ? '' : 'disabled'}></div></div>
+  <p class="hint">То же самое можно сделать командой /crm_topics в личке с ботом. Переписка в обоих режимах сохраняется в базе и видна здесь.</p>
+  <div class="card"><small class="hint">Цена подписки</small><b>${rub(st.price)}</b> · период ${st.period_days} дн.<div class="hint">Меняется переменными PRICE и PERIOD_DAYS в Bothost.</div></div>`;
+  $('#tp').onchange = async e => {
+    const r = await api('settings', {set:true, topics:e.target.checked});
+    toast(r.topics_on ? 'CRM в топиках включена' : 'CRM в топиках выключена. Работаем в мини-аппе.');
+    renderSettings();
+  };
+}
+
+/* ---------- карточка лида ---------- */
+function setBack(on) {
+  if (!tg || !tg.BackButton) return;
+  if (on) { tg.BackButton.show(); tg.BackButton.onClick(closeLead); } else { tg.BackButton.hide(); tg.BackButton.offClick(closeLead); }
+}
+async function openLead(id) {
+  S.cur = id; S.tab = 'chat'; S.lastKey = ''; S.data = null;
+  $('#lead').className = 'on';
+  $('#lead').innerHTML = '<div class="empty" style="margin:auto">Загрузка…</div>';
+  setBack(true);
+  S.data = await api('lead', {id});
+  buildLead();
+}
+function closeLead() {
+  S.cur = null; $('#lead').className = ''; $('#lead').innerHTML = ''; setBack(false);
+  loadLeads().then(render);
+}
+function buildLead() {
+  const l = S.data.lead;
+  $('#lead').innerHTML = `
+  <div class="lh"><button class="btn ghost" id="bk">‹</button><div class="rb"><b>${esc(l.name)}</b>
+    <div class="hint">${l.username ? '@' + esc(l.username) + ' · ' : ''}id ${l.id}</div></div>
+    <a class="btn ghost" href="${l.username ? 'https://t.me/' + esc(l.username) : 'tg://user?id=' + l.id}" style="text-decoration:none">Telegram</a></div>
+  <div class="lt"><button data-t="chat">Чат</button><button data-t="profile">Профиль</button><button data-t="notes">Заметки</button></div>
+  <div class="lbody" id="lb"></div><div id="cmp"></div>`;
+  $('#bk').onclick = closeLead;
+  document.querySelectorAll('.lt button').forEach(b => b.onclick = () => { S.tab = b.dataset.t; drawLead(true); });
+  drawLead(true);
+}
+function drawLead(force) {
+  document.querySelectorAll('.lt button').forEach(b => b.classList.toggle('on', b.dataset.t === S.tab));
+  if (S.tab === 'chat') drawChat(force); else if (S.tab === 'profile') drawProfile(); else drawNotes();
+  if (S.tab !== 'chat') $('#cmp').innerHTML = '';
+}
+function drawChat(force) {
+  const d = S.data, m = d.messages, key = m.length + ':' + (m.length ? m[m.length - 1].id : 0);
+  if (!force && key === S.lastKey) return;
+  const lb = $('#lb'), nearBottom = force || lb.scrollHeight - lb.scrollTop - lb.clientHeight < 120;
+  S.lastKey = key;
+  lb.innerHTML = m.length ? '<div class="msgs">' + m.map(x => `<div class="m ${x.direction}">${esc(x.text)}<i>${fmtFull(x.ts)}</i></div>`).join('') + '</div>'
+    : '<div class="empty">Переписки пока нет</div>';
+  if (nearBottom) lb.scrollTop = lb.scrollHeight;
+  if (!$('#ta')) {
+    $('#cmp').innerHTML = `<div class="comp"><div class="q"><button class="btn ghost" id="pay">💳 Отправить форму оплаты</button></div>
+      <div class="rr"><textarea id="ta" rows="1" placeholder="Сообщение лиду…"></textarea><button class="btn" id="snd">➤</button></div><div class="err" id="er"></div></div>`;
+    const ta = $('#ta');
+    ta.oninput = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 120) + 'px'; };
+    $('#snd').onclick = send;
+    $('#pay').onclick = async () => {
+      const r = await api('pay', {id:S.cur}); $('#er').textContent = r.ok ? '' : r.error; if (r.ok) refreshLead();
+    };
+  }
+}
+async function send() {
+  const ta = $('#ta'), text = ta.value.trim(); if (!text) return;
+  $('#snd').disabled = true;
+  const r = await api('send', {id:S.cur, text});
+  $('#snd').disabled = false;
+  if (r.ok) { ta.value = ''; ta.style.height = 'auto'; $('#er').textContent = ''; refreshLead(true); } else $('#er').textContent = r.error;
+}
+async function refreshLead(force) {
+  if (!S.cur) return;
+  const id = S.cur, d = await api('lead', {id, light:true});
+  if (S.cur !== id) return;
+  S.data.messages = d.messages; S.data.notes = d.notes; S.data.lead = d.lead;
+  if (S.tab === 'chat') drawChat(force); else if (S.tab === 'notes') drawNotes();
+}
+function drawProfile() {
+  const d = S.data, l = d.lead, p = d.profile;
+  $('#lb').innerHTML = `
+  <div class="card">
+    <small class="hint">Этап сделки</small>
+    <select id="st">${Object.entries(STAGES).map(([k, v]) => `<option value="${k}" ${l.stage === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+    <small class="hint" style="margin-top:10px">Ожидаемая сумма, ₽ (пусто = цена подписки ${rub(S.price)})</small>
+    <input type="number" id="am" inputmode="decimal" value="${l.amount ?? ''}">
+    <button class="btn" id="sv" style="margin-top:10px">Сохранить</button>
+    <div class="hint" style="margin-top:6px">${l.active ? 'Сейчас идёт подписка до ' + esc(l.expires) + ', этап «Оплатил» ставится автоматически.' : ''}</div>
+  </div>
+  <h3>Профиль из теста</h3>` + (p ? `
+    ${p.segment ? `<div class="card"><b>${esc(p.segment)}</b><div class="hint">Рекомендуемый продукт: ${esc(p.product)}<br>Направление: ${esc(p.direction)}<br>Доп. проблемы: ${esc(p.problems)}</div></div>` : `<div class="hint">Тест не завершён, этап: ${esc(p.stage)}</div>`}
+    <div class="hint" style="margin-top:8px">Источник: ${esc(p.source || '—')}</div>
+    ${p.qa.map(x => `<div class="qa"><small>${esc(x.q)}</small>${esc(x.a)}</div>`).join('')}
+    ${p.resume ? `<h3>Резюме</h3><div class="card">${esc(p.resume)}</div>` : ''}` : '<div class="hint">Этот человек не проходил воронку из Instagram.</div>');
+  $('#sv').onclick = async () => {
+    const r = await api('stage', {id:S.cur, stage:$('#st').value, amount:$('#am').value});
+    if (!r.ok) return toast(r.error);
+    $('#sv').textContent = 'Сохранено ✓'; setTimeout(() => { const b = $('#sv'); if (b) b.textContent = 'Сохранить'; }, 1200);
+    S.data.lead.stage = $('#st').value; S.data.lead.amount = $('#am').value ? +$('#am').value : null;
+  };
+}
+function drawNotes() {
+  const n = S.data.notes;
+  if (!$('#nt')) {
+    $('#lb').innerHTML = `<textarea id="nt" rows="3" placeholder="Заметка о человеке: что обсуждали, когда написать снова…"></textarea>
+      <button class="btn" id="na" style="margin-top:8px">Добавить заметку</button><div id="nl"></div>`;
+    $('#na').onclick = async () => {
+      const t = $('#nt').value.trim(); if (!t) return;
+      await api('note', {id:S.cur, text:t}); $('#nt').value = ''; refreshLead();
+    };
+  }
+  $('#nl').innerHTML = n.length ? n.map(x => `<div class="note">${esc(x.text)}<small><span>${fmtFull(x.ts)}</span><a href="#" data-n="${x.id}">удалить</a></small></div>`).join('') : '<div class="empty">Заметок пока нет</div>';
+  document.querySelectorAll('[data-n]').forEach(a => a.onclick = async e => {
+    e.preventDefault(); await api('note_del', {note_id:+a.dataset.n}); refreshLead();
+  });
+}
+
+/* ---------- старт и обновление ---------- */
+(async () => {
+  try {
+    await loadLeads(); render();
+    const deep = new URLSearchParams(location.search).get('lead');
+    if (deep) openLead(+deep);
+  } catch (e) { if (e.message !== 'auth') $('#main').innerHTML = '<div class="empty">Не удалось загрузить. Потяните и откройте заново.</div>'; }
+})();
+setInterval(() => { if (document.hidden) return;
+  if (S.cur) refreshLead().catch(() => {});
+  else if (S.view === 'leads' || S.view === 'stats') loadLeads().then(() => { if (S.view === 'stats' && !document.activeElement.matches('input')) render(); else if (S.view === 'leads') drawRows(); }).catch(() => {});
+}, 6000);
+</script>
+</body>
+</html>
