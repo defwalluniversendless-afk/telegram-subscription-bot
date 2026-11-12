@@ -71,12 +71,16 @@ h3{margin:18px 0 8px;font-size:15px}
 .m{max-width:82%;padding:8px 11px;border-radius:16px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
 .m.in{background:var(--card);border:1px solid var(--line);align-self:flex-start;border-bottom-left-radius:5px}
 .m.out{background:var(--acc);color:#fff;align-self:flex-end;border-bottom-right-radius:5px}
+.m.sys{align-self:center;max-width:94%;background:transparent;border:1px dashed var(--line);color:var(--hint);font-size:12px;border-radius:12px;text-align:center;padding:5px 10px}
+.m.sys i{text-align:center}
+.m.out.del{opacity:.55}.m.out.del span{text-decoration:line-through}
+.m[data-cd]{cursor:pointer}
 .m i{display:block;font-style:normal;font-size:10px;opacity:.6;margin-top:2px;text-align:right}
 .comp{flex:none;border-top:1px solid var(--line);padding:8px 12px calc(8px + env(safe-area-inset-bottom));background:var(--bg)}
 .comp .rr{display:flex;gap:8px;align-items:flex-end}
 .comp textarea{max-height:120px}
 .comp .q{display:flex;gap:6px;margin-bottom:6px}
-.qa{padding:9px 0;border-bottom:1px solid var(--line)}
+.qa{padding:9px 0;border-bottom:1px solid var(--line);white-space:pre-wrap;overflow-wrap:anywhere}
 .qa small{color:var(--hint);display:block;font-size:12px}
 .note{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-top:8px;white-space:pre-wrap;overflow-wrap:anywhere}
 .note small{display:flex;justify-content:space-between;color:var(--hint);margin-top:4px}
@@ -109,8 +113,10 @@ const STAGES = {entered:'Зашёл в бота', series:'Серия уроко�
 const SC = {entered:'#ffc14d', series:'#ffc14d', ready:'#3ddc97', won:'#ff4d94', lost:'#8d8d99'};   // жёлтый, зелёный, розовый, серый
 const ORDER = ['entered','series','ready','won','lost'];
 const SEG = {ready:['🔥','Готов'], interested:['🙂','Тёплый'], cold:['❄️','Холодный']};
-const FILTERS = [['all','Все'],['unread','Новые сообщения'],['ready','🟢 К закрытию'],['prog','🟡 В процессе'],['won','🩷 Купили'],['lost','⚪ Закрыты']];
-const S = {view:'board', leads:[], stats:null, price:0, filter:'all', q:'', cur:null, tab:'chat', data:null, lastKey:'', settings:null};
+const BASE_FILTERS = [['all','Все'],['unread','Новые сообщения'],['ready','🟢 К закрытию'],['prog','🟡 В процессе'],['won','🩷 Купили'],['lost','⚪ Закрыты']];
+const filters = () => BASE_FILTERS.concat((S.sources || []).map(x => ['src:' + x.id, x.icon + ' ' + x.label]));
+const srcTag = l => { const x = (S.sources || []).find(s => s.id === l.src); return x ? `<span class="tag">${x.icon} ${esc(x.label)}${l.src_detail ? ' · ' + esc(l.src_detail) : ''}</span>` : ''; };
+const S = {sources:[], trashDays:15, view:'board', leads:[], stats:null, price:0, filter:'all', q:'', cur:null, tab:'chat', data:null, lastKey:'', settings:null};
 let calc = {price:null, conv:10};
 
 async function api(path, body = {}) {
@@ -139,7 +145,7 @@ function render() {
 }
 async function loadLeads() {
   const d = await api('leads');
-  S.leads = d.leads; S.stats = d.stats; S.price = d.price;
+  S.leads = d.leads; S.stats = d.stats; S.price = d.price; S.trashDays = d.trash_days || 15; S.sources = d.sources || [];
   if (calc.price === null) calc.price = d.price;
 }
 
@@ -150,12 +156,13 @@ function passes(l) {
   if (S.filter === 'prog' && l.stage !== 'entered' && l.stage !== 'series') return false;
   if (S.filter === 'won' && l.stage !== 'won') return false;
   if (S.filter === 'lost' && l.stage !== 'lost') return false;
+  if (S.filter.startsWith('src:') && l.src !== S.filter.slice(4)) return false;
   const q = S.q.trim().toLowerCase();
   return !q || (l.name + ' ' + (l.username || '') + ' ' + l.id).toLowerCase().includes(q);
 }
 function renderLeads() {
   $('#top').innerHTML = '<input type="search" id="q" placeholder="Поиск по имени, @нику, id"><div class="chips">' +
-    FILTERS.map(f => `<button class="chip ${S.filter === f[0] ? 'on' : ''}" data-f="${f[0]}">${f[1]}</button>`).join('') + '</div>';
+    filters().map(f => `<button class="chip ${S.filter === f[0] ? 'on' : ''}" data-f="${f[0]}">${f[1]}</button>`).join('') + '</div>';
   $('#q').value = S.q;
   $('#q').oninput = e => { S.q = e.target.value; drawRows(); };
   document.querySelectorAll('.chip').forEach(c => c.onclick = () => { S.filter = c.dataset.f; renderLeads(); });
@@ -171,10 +178,13 @@ function drawRows() {
   $('#rows').innerHTML = list.length ? list.map(l => {
     const tags = [`<span class="tag st">${STAGES[l.stage]}</span>`];
     if (l.active) tags.push(`<span class="tag">до ${esc(l.expires)}${l.days_left <= 7 ? ' · ' + l.days_left + ' дн.' : ''}</span>`);
+    if (l.stage === 'lost' && l.trash_left != null) tags.push(`<span class="tag">🗑 очистка через ${l.trash_left} дн.</span>`);
+    if (l.stage === 'lost' && l.purged) tags.push('<span class="tag">очищен</span>');
+    if (l.src) tags.push(srcTag(l));
     if (l.seg) tags.push(`<span class="tag">${SEG[l.seg][0]} ${SEG[l.seg][1]}</span>`);
     else if (l.funnel) tags.push('<span class="tag">тест не закончен</span>');
     if (l.blocked) tags.push('<span class="tag bad">заблокирован</span>');
-    const prev = l.last ? (l.last.dir === 'out' ? 'Вы: ' : '') + l.last.text : 'Сообщений пока нет';
+    const prev = l.last ? (l.last.dir === 'out' ? 'Вы: ' : '') + l.last.text : (l.purged ? 'Данные очищены' : 'Сообщений пока нет');
     return `<div class="row ${l.stage === 'lost' ? 'lost' : ''}" style="--sc:${SC[l.stage]}" data-id="${l.id}"><div class="ava">${esc((l.name || '?').trim().charAt(0).toUpperCase())}</div>
       <div class="rb"><div class="r1"><b>${esc(l.name)}</b><span class="time">${l.last ? fmtTime(l.last.ts) : ''}</span></div>
       <div class="r2">${esc(prev)}</div><div class="tags">${tags.join('')}</div></div>
@@ -194,10 +204,11 @@ function renderBoard() {
     '<div class="board">' + ORDER.map(k => {
       const items = by(k);
       return `<div class="col" style="--sc:${SC[k]}"><h4>${STAGES[k]}<span>${items.length}</span></h4>` +
+        (k === 'lost' ? `<div class="hint" style="font-size:12px">🗑 Корзина: через ${S.trashDays} дн. переписка, заметки и профиль очищаются</div>` : '') +
         (items.map(l => {
-          const prev = l.last ? (l.last.dir === 'out' ? 'Вы: ' : '') + l.last.text : 'Сообщений пока нет';
-          const seg = l.seg ? `<span class="tag">${SEG[l.seg][0]} ${SEG[l.seg][1]}</span>` : '';
-          const sub = l.active ? `<span class="tag">до ${esc(l.expires)}</span>` : '';
+          const prev = l.last ? (l.last.dir === 'out' ? 'Вы: ' : '') + l.last.text : (l.purged ? 'Данные очищены' : 'Сообщений пока нет');
+          const seg = srcTag(l) + (l.seg ? `<span class="tag">${SEG[l.seg][0]} ${SEG[l.seg][1]}</span>` : '');
+          const sub = l.active ? `<span class="tag">до ${esc(l.expires)}</span>` : (l.trash_left != null ? `<span class="tag">🗑 ${l.trash_left} дн.</span>` : (l.purged && k === 'lost' ? '<span class="tag">очищен</span>' : ''));
           return `<div class="kc ${k === 'lost' ? 'lost' : ''}" style="--sc:${SC[k]}" data-id="${l.id}"><div class="r1"><b>${esc(l.name)}</b>${l.unread ? `<span class="badge">${l.unread}</span>` : ''}</div>
             <div class="r2">${esc(prev)}</div><div class="tags">${seg}${sub}</div></div>`;
         }).join('') || '<div class="hint">Пусто</div>') + '</div>';
@@ -227,6 +238,7 @@ function renderStats() {
     <div class="card"><small>Если оплатят все</small><strong>${rub(s.potential_all)}</strong></div>
   </div>
   <p class="hint">Открытых лидов (ещё не купили и не закрыты): ${s.open}. Оценка считается по стадии воронки, вероятности в bot.py (CRM_PROB_STAGE). Выручка считается как число оплат × цена (${rub(S.price)}).</p>
+  ${S.sources.length ? `<h3>По источникам</h3><div class="grid">${S.sources.map(x => { const c = s.src[x.id] || {leads:0, active:0, ready:0}; return `<div class="card"><small>${x.icon} ${esc(x.label)}</small><strong>${c.leads}</strong><small>готовы к закрытию: ${c.ready} · купили: ${c.active}</small></div>`; }).join('')}</div>` : ''}
   <h3>По сегментам теста</h3>
   <div class="grid">
     <div class="card"><small>🔥 Готовы</small><strong>${s.seg.ready}</strong></div>
@@ -255,7 +267,13 @@ async function renderSettings() {
     : 'Не настроена: в переменных бота нет CRM_CHAT_ID.'}</div></div>
     <input type="checkbox" id="tp" ${st.topics_on ? 'checked' : ''} ${st.topics_available ? '' : 'disabled'}></div></div>
   <p class="hint">То же самое можно сделать командой /crm_topics в личке с ботом. Переписка в обоих режимах сохраняется в базе и видна здесь.</p>
-  <div class="card"><small class="hint">Цена подписки</small><b>${rub(st.price)}</b> · период ${st.period_days} дн.<div class="hint">Меняется переменными PRICE и PERIOD_DAYS в Bothost.</div></div>`;
+  <div class="card"><b>Автоочистка</b><div class="hint" style="margin-top:4px">
+    🗑 «Не купил / закрыт»: через ${st.trash_days} дн. удаляются переписка, заметки, профиль теста и тема в группе, остаётся короткая справка.<br>
+    ✅ Покупатели: серые события старше ${st.buyer_sys_days} дн. удаляются.<br>
+    ⚪ Остальные: серые события старше ${st.sys_days} дн. удаляются.<br>
+    ${st.stale_days ? '😴 Зашли и молчат ' + st.stale_days + ' дн. без теста: уходят в корзину сами.<br>' : ''}
+    Всегда остаются: прохождение теста, оплаты, живая переписка и заметки (кроме корзины).</div></div>
+  <div class="card" style="margin-top:10px"><small class="hint">Цена подписки</small><b>${rub(st.price)}</b> · период ${st.period_days} дн.<div class="hint">Меняется переменными PRICE и PERIOD_DAYS в Bothost.</div></div>`;
   $('#tp').onchange = async e => {
     const r = await api('settings', {set:true, topics:e.target.checked});
     toast(r.topics_on ? 'CRM в топиках включена' : 'CRM в топиках выключена. Работаем в мини-аппе.');
@@ -302,16 +320,17 @@ function drawLead(force) {
   if (S.tab !== 'chat') $('#cmp').innerHTML = '';
 }
 function drawChat(force) {
-  const d = S.data, m = d.messages, key = m.length + ':' + (m.length ? m[m.length - 1].id : 0);
+  const d = S.data, m = d.messages, key = m.length + ':' + (m.length ? m[m.length - 1].id : 0) + ':' + m.filter(x => x.deleted).length;
   if (!force && key === S.lastKey) return;
   const lb = $('#lb'), nearBottom = force || lb.scrollHeight - lb.scrollTop - lb.clientHeight < 120;
   S.lastKey = key;
-  lb.innerHTML = m.length ? '<div class="msgs">' + m.map(x => `<div class="m ${x.direction}">${esc(x.text)}<i>${fmtFull(x.ts)}</i></div>`).join('') + '</div>'
+  lb.innerHTML = m.length ? '<div class="msgs">' + m.map(x => `<div class="m ${x.direction} ${x.deleted ? 'del' : ''}" ${x.can_del ? `data-cd="${x.id}"` : ''}>${x.deleted ? '🗑 ' : ''}<span>${esc(x.text)}</span><i>${fmtFull(x.ts)}${x.deleted ? ' · удалено у человека' : ''}</i></div>`).join('') + '</div>'
     : '<div class="empty">Переписки пока нет</div>';
+  lb.querySelectorAll('[data-cd]').forEach(b => b.onclick = () => delMsg(+b.dataset.cd));
   if (nearBottom) lb.scrollTop = lb.scrollHeight;
   if (!$('#ta')) {
     $('#cmp').innerHTML = `<div class="comp"><div class="q"><button class="btn ghost" id="pay">💳 Оплата</button><button class="btn ghost" id="bought">✅ Купил</button><button class="btn ghost" id="lostb">✖ Не купил</button></div>
-      <div class="rr"><textarea id="ta" rows="1" placeholder="Сообщение лиду…"></textarea><button class="btn" id="snd">➤</button></div><div class="err" id="er"></div></div>`;
+      <div class="rr"><textarea id="ta" rows="1" placeholder="Сообщение лиду…"></textarea><button class="btn" id="snd">➤</button></div><div class="err" id="er"></div><div class="hint" style="font-size:12px;margin-top:4px">Нажмите на своё сообщение, чтобы удалить его у человека. Серым показано, что человек нажимает в боте.</div></div>`;
     const ta = $('#ta');
     ta.oninput = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 120) + 'px'; };
     $('#snd').onclick = send;
@@ -326,8 +345,18 @@ async function setStage(k) {
   const a = $('#am') ? $('#am').value : (S.data.lead.amount ?? '');
   const r = await api('stage', {id:S.cur, stage:k, amount:a});
   if (!r.ok) return toast(r.error);
+  if (k === 'lost') toast('Лид в корзине: через ' + S.trashDays + ' дн. его переписка, заметки и профиль очистятся. Вернуть: выберите другую стадию в профиле.');
   await refreshLead(true);
   if (S.tab === 'profile') drawProfile();
+}
+function delMsg(mid) {
+  const run = async ok => {
+    if (!ok) return;
+    const r = await api('del', {id:S.cur, msg_id:mid});
+    if (!r.ok) toast(r.error);
+    refreshLead(true);
+  };
+  if (tg && tg.showConfirm) tg.showConfirm('Удалить это сообщение у человека в Telegram?', run); else run(confirm('Удалить это сообщение у человека в Telegram?'));
 }
 async function send() {
   const ta = $('#ta'), text = ta.value.trim(); if (!text) return;
@@ -346,6 +375,8 @@ async function refreshLead(force) {
 function drawProfile() {
   const d = S.data, l = d.lead, p = d.profile;
   $('#lb').innerHTML = `
+  ${l.stage === 'lost' && l.trash_left != null ? `<div class="card" style="border-color:var(--bad);margin-bottom:10px">🗑 В корзине. Через ${l.trash_left} дн. удалятся переписка, заметки и профиль теста. Чтобы отменить, выберите другую стадию.</div>` : ''}
+  ${l.summary ? `<div class="card" style="margin-bottom:10px"><small class="hint">${l.stage === 'lost' && l.purged ? '🧹 Данные очищены. Осталось' : 'История до очистки'}</small>${esc(l.summary)}</div>` : ''}
   <div class="card">
     <small class="hint">Стадия (нажмите, чтобы поменять)</small>
     <div class="pills" id="stp">${[['auto','Авто']].concat(Object.entries(STAGES)).map(([k, v]) => `<button class="pill ${(l.override ? l.stage : 'auto') === k ? 'on' : ''}" data-k="${k}" style="--sc:${SC[k] || 'var(--acc)'}">${v}</button>`).join('')}</div>
@@ -356,7 +387,7 @@ function drawProfile() {
     <div class="hint" style="margin-top:6px">${l.active ? 'Сейчас идёт подписка до ' + esc(l.expires) + ', стадия «Купил подписку» ставится автоматически.' : ''}</div>
   </div>
   <h3>Профиль из теста</h3>` + (p ? `
-    ${p.segment ? `<div class="card"><b>${esc(p.segment)}</b><div class="hint">Рекомендуемый продукт: ${esc(p.product)}<br>Направление: ${esc(p.direction)}<br>Доп. проблемы: ${esc(p.problems)}</div></div>` : `<div class="hint">Тест не завершён, этап: ${esc(p.stage)}</div>`}
+    ${p.segment ? `<div class="card"><b>${esc(p.segment)}</b><div class="hint">${[p.product && 'Рекомендуемый продукт: ' + esc(p.product), p.direction && 'Направление: ' + esc(p.direction), p.problems && 'Доп. проблемы: ' + esc(p.problems)].filter(Boolean).join('<br>')}</div></div>` : `<div class="hint">Тест не завершён, этап: ${esc(p.stage)}</div>`}
     <div class="hint" style="margin-top:8px">Источник: ${esc(p.source || '—')}</div>
     ${p.qa.map(x => `<div class="qa"><small>${esc(x.q)}</small>${esc(x.a)}</div>`).join('')}
     ${p.resume ? `<h3>Резюме</h3><div class="card">${esc(p.resume)}</div>` : ''}` : '<div class="hint">Этот человек не проходил воронку из Instagram.</div>');
