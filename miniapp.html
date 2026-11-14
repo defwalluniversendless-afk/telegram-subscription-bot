@@ -135,6 +135,9 @@ function fmtTime(ts) {
     : d.toLocaleDateString('ru-RU', {day:'2-digit', month:'2-digit'});
 }
 const fmtFull = ts => new Date(ts * 1000).toLocaleString('ru-RU', {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'});
+function ask(text, ok) {
+  if (tg && tg.showConfirm) tg.showConfirm(text, y => { if (y) ok(); }); else if (confirm(text)) ok();
+}
 function toast(t) { if (tg && tg.showAlert) tg.showAlert(t); else alert(t); }
 
 /* ---------- навигация ---------- */
@@ -267,13 +270,22 @@ async function renderSettings() {
     : 'Не настроена: в переменных бота нет CRM_CHAT_ID.'}</div></div>
     <input type="checkbox" id="tp" ${st.topics_on ? 'checked' : ''} ${st.topics_available ? '' : 'disabled'}></div></div>
   <p class="hint">То же самое можно сделать командой /crm_topics в личке с ботом. Переписка в обоих режимах сохраняется в базе и видна здесь.</p>
-  <div class="card"><b>Автоочистка</b><div class="hint" style="margin-top:4px">
+  <div class="card"><b>Тест воронки на себе</b><div class="hint" style="margin:4px 0 8px">Пройти воронку заново можно сколько угодно раз.</div>
+    <button class="btn ghost" id="sr" style="width:100%">🔄 Сбросить мою воронку и начать</button>
+    <button class="btn ghost" id="se" style="width:100%;margin-top:8px">🗑 Удалить мою запись из базы</button></div>
+  <div class="card" style="margin-top:10px"><b>Автоочистка</b><div class="hint" style="margin-top:4px">
     🗑 «Не купил / закрыт»: через ${st.trash_days} дн. удаляются переписка, заметки, профиль теста и тема в группе, остаётся короткая справка.<br>
     ✅ Покупатели: серые события старше ${st.buyer_sys_days} дн. удаляются.<br>
     ⚪ Остальные: серые события старше ${st.sys_days} дн. удаляются.<br>
     ${st.stale_days ? '😴 Зашли и молчат ' + st.stale_days + ' дн. без теста: уходят в корзину сами.<br>' : ''}
     Всегда остаются: прохождение теста, оплаты, живая переписка и заметки (кроме корзины).</div></div>
   <div class="card" style="margin-top:10px"><small class="hint">Цена подписки</small><b>${rub(st.price)}</b> · период ${st.period_days} дн.<div class="hint">Меняется переменными PRICE и PERIOD_DAYS в Bothost.</div></div>`;
+  $('#sr').onclick = () => ask('Сбросить вашу воронку и начать заново? Бот сразу пришлёт вам первый шаг.', async () => {
+    const r = await api('reset', {self:true}); toast(r.ok ? 'Готово: бот прислал вам первый шаг воронки.' : 'Не получилось.');
+  });
+  $('#se').onclick = () => ask('Удалить вашу запись из базы и воронки? Потом можно снова пройти воронку с нуля по ссылке.', async () => {
+    const r = await api('erase', {self:true}); toast(r.ok ? 'Ваша запись удалена. Откройте ссылку воронки, чтобы начать с нуля.' : r.error);
+  });
   $('#tp').onchange = async e => {
     const r = await api('settings', {set:true, topics:e.target.checked});
     toast(r.topics_on ? 'CRM в топиках включена' : 'CRM в топиках выключена. Работаем в мини-аппе.');
@@ -390,8 +402,20 @@ function drawProfile() {
     ${p.segment ? `<div class="card"><b>${esc(p.segment)}</b><div class="hint">${[p.product && 'Рекомендуемый продукт: ' + esc(p.product), p.direction && 'Направление: ' + esc(p.direction), p.problems && 'Доп. проблемы: ' + esc(p.problems)].filter(Boolean).join('<br>')}</div></div>` : `<div class="hint">Тест не завершён, этап: ${esc(p.stage)}</div>`}
     <div class="hint" style="margin-top:8px">Источник: ${esc(p.source || '—')}</div>
     ${p.qa.map(x => `<div class="qa"><small>${esc(x.q)}</small>${esc(x.a)}</div>`).join('')}
-    ${p.resume ? `<h3>Резюме</h3><div class="card">${esc(p.resume)}</div>` : ''}` : '<div class="hint">Этот человек не проходил воронку из Instagram.</div>');
+    ${p.resume ? `<h3>Резюме</h3><div class="card">${esc(p.resume)}</div>` : ''}` : '<div class="hint">Этот человек не проходил воронку.</div>') + `
+  <h3>Управление</h3>
+  <div class="card"><div class="hint" style="margin-bottom:8px">Для тестов и уборки. Подписка и платежи не затрагиваются.</div>
+    <button class="btn ghost" id="rst" style="width:100%">🔄 Сбросить воронку на нулевой шаг</button>
+    <button class="btn ghost" id="ers" style="width:100%;margin-top:8px;color:var(--bad)">🗑 Удалить из базы</button></div>`;
   document.querySelectorAll('#stp .pill').forEach(p => p.onclick = () => setStage(p.dataset.k));
+  $('#rst').onclick = () => ask('Сбросить воронку этого человека на нулевой шаг? Ему ничего не отправится: когда он снова откроет ссылку воронки, начнёт сначала. Серые события и стадия сбросятся, переписка и заметки останутся.', async () => {
+    const r = await api('reset', {id:S.cur}); if (!r.ok) return toast(r.error);
+    S.data = await api('lead', {id:S.cur}); updHead(); drawProfile(); toast('Воронка сброшена на нулевой шаг.');
+  });
+  $('#ers').onclick = () => ask('Удалить человека из базы и из воронки? Пропадут переписка, заметки и профиль. Платежи останутся в истории. Если он напишет снова, начнёт с нулевого шага.', async () => {
+    const r = await api('erase', {id:S.cur}); if (!r.ok) return toast(r.error);
+    closeLead();
+  });
   $('#sv').onclick = async () => {
     const r = await api('stage', {id:S.cur, stage:l.override ? l.stage : 'auto', amount:$('#am').value});
     if (!r.ok) return toast(r.error);

@@ -588,7 +588,6 @@ async def extend(uid: int, days: float, method_id: str | None = None,
             base, was_active = exp, True
     new_exp = base + timedelta(days=days)
     sub_text = f"💳 Подписка {'продлена' if was_active else 'оформлена'}, активна до {fmt(new_exp)}."
-    crm_sys(uid, sub_text)
     await crm_notify(uid, sub_text)
     db.execute("""INSERT INTO users(user_id, expires_at, active, method_id, method_mode) VALUES(?,?,1,?,?)
                   ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at, active=1,
@@ -602,6 +601,10 @@ async def extend(uid: int, days: float, method_id: str | None = None,
                (uid, iso(new_exp), method_id, method_mode if method_id else None,
                 int(replace_method), int(replace_method), int(replace_method)))
     db.commit()
+    try:  # отметка в CRM: после сохранения подписки и без права сломать выдачу доступа
+        crm_sys(uid, sub_text)
+    except Exception:
+        logging.exception("не удалось записать оплату в CRM")
     status = autopay_status(
         db.execute("SELECT autopay, method_id, method_mode FROM users WHERE user_id=?", (uid,)).fetchone()
     )
@@ -1447,6 +1450,74 @@ async def cmd_links(m: Message):
     lines += ["", "Чтобы различать ролики или посты, добавьте метку: "
               f"<code>?start={next(iter(FUNNEL_SOURCES))}_reels1</code>. В CRM будет видно источник и метку."]
     await m.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+def crm_resolve_user(arg: str):
+    arg = arg.strip()
+    if arg.lstrip("-").isdigit():
+        return int(arg)
+    r = db.execute("SELECT user_id FROM users WHERE lower(username)=lower(?)", (arg.lstrip("@"),)).fetchone()
+    return r["user_id"] if r else None
+
+
+def crm_cmd_target(m: Message, command: CommandObject):
+    """Кого касается команда: id или @ник в аргументе; в теме лида в CRM-группе это сам лид; иначе вы сами."""
+    arg = (command.args or "").strip()
+    if arg:
+        return crm_resolve_user(arg)
+    if CRM_CHAT_ID and m.chat.id == CRM_CHAT_ID and m.message_thread_id:
+        r = db.execute("SELECT user_id FROM crm_topics WHERE chat_id=? AND thread_id=?",
+                       (m.chat.id, m.message_thread_id)).fetchone()
+        return r["user_id"] if r else None
+    return ADMIN_ID
+
+
+@dp.message(Command("reset"), F.from_user.id == ADMIN_ID)
+async def cmd_reset(m: Message, command: CommandObject):
+    """/reset: сбросить свою воронку и начать заново. /reset 123456 или /reset @ник: сбросить человека.
+    В теме лида в CRM-группе: просто /reset."""
+    uid = crm_cmd_target(m, command)
+    if uid is None:
+        await m.answer("Не нашёл такого человека. Укажите id или @ник, либо отправьте команду в его теме.")
+        return
+    await crm_reset_lead(uid, start=(uid == ADMIN_ID))
+    if uid == ADMIN_ID:
+        await m.answer("🔄 Ваша воронка сброшена, начинаем с нулевого шага 👆")
+    else:
+        await m.answer(f"🔄 Воронка {html.escape(crm_display_name(uid))} сброшена на нулевой шаг. Ему ничего не "
+                       "отправлено: когда он снова откроет ссылку воронки, начнёт сначала.")
+
+
+@dp.message(Command("erase"), F.from_user.id == ADMIN_ID)
+async def cmd_erase(m: Message, command: CommandObject):
+    """/erase: удалить из базы себя. /erase 123456 или /erase @ник: удалить человека. В теме лида: просто /erase."""
+    uid = crm_cmd_target(m, command)
+    if uid is None:
+        await m.answer("Не нашёл такого человека. Укажите id или @ник, либо отправьте команду в его теме.")
+        return
+    await m.answer(
+        f"Удалить из базы <b>{html.escape(crm_display_name(uid))}</b> (id <code>{uid}</code>)?\n"
+        "Пропадут переписка, заметки, воронка и запись о нём. Платежи останутся в истории. "
+        "Если он напишет снова, начнёт с нулевого шага.",
+        reply_markup=markup([btn("🗑 Да, удалить", f"er:y:{uid}"), btn("Отмена", "er:n:0")]))
+
+
+@dp.callback_query(F.data.startswith("er:"), F.from_user.id == ADMIN_ID)
+async def cb_erase(cb: CallbackQuery):
+    _, act, uid = cb.data.split(":")
+    if act != "y":
+        await cb.answer("Отменено")
+        await cb.message.delete()
+        return
+    err = await crm_erase_lead(int(uid))
+    await cb.answer("Удалено" if not err else "Не удалено", show_alert=bool(err))
+    if err:
+        await cb.message.answer("⚠️ " + err)
+    else:
+        try:
+            await cb.message.edit_text(f"🗑 Удалён из базы: id <code>{uid}</code>.")
+        except Exception:
+            pass
 
 
 @dp.message(Command("chatid"))
@@ -2938,8 +3009,9 @@ async def check_cleanup():
             trashed += 1
         db.commit()
     purged = 0
-    for row in db.execute("SELECT user_id FROM crm_leads WHERE stage='lost' AND trashed_at>0 AND trashed_at<? "
-                          "AND purged_at=0", (t - CRM_TRASH_DAYS * 86400,)).fetchall():
+    for row in db.execute(f"SELECT user_id FROM crm_leads WHERE stage='lost' AND trashed_at>0 AND trashed_at<? "
+                          f"AND purged_at=0 AND user_id NOT IN ({CRM_BUYERS_SQL})",
+                          (t - CRM_TRASH_DAYS * 86400,)).fetchall():
         try:
             await crm_purge(row["user_id"])
             purged += 1
@@ -2962,6 +3034,76 @@ async def check_cleanup():
             db.commit()
         except Exception:
             logging.exception("VACUUM не удался")
+
+
+# ---------- Сброс воронки и удаление человека (для тестов и уборки) ----------
+def crm_display_name(uid: int) -> str:
+    r = db.execute("SELECT name FROM crm_profiles WHERE user_id=?", (uid,)).fetchone()
+    if r and r["name"]:
+        return r["name"]
+    u = db.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
+    return f"@{u['username']}" if u and u["username"] else str(uid)
+
+
+def crm_forget_state(uid: int):
+    awaiting_help.discard(uid)
+    awaiting_compose.pop(uid, None)
+    awaiting_custom_days.pop(uid, None)
+
+
+async def fx_begin(uid: int):
+    """Первый шаг воронки: приветствие и выбор бесплатного урока."""
+    await bot.send_message(uid, FX_GREETING)
+    await bot.send_message(uid, FX_PICK_Q, reply_markup=markup(
+        *[[btn(label, f"fx:l:{i}")] for i, (label, _) in enumerate(FX_LESSONS)]))
+
+
+async def crm_reset_lead(uid: int, start: bool = False):
+    """Воронка с нулевого шага. Подписка, платежи, переписка и заметки остаются.
+    start=True (свой тест): сразу присылает первый шаг. Для чужого человека ему ничего не отправляется:
+    когда он снова откроет ссылку воронки, начнёт сначала."""
+    row = db.execute("SELECT source FROM funnel_users WHERE user_id=?", (uid,)).fetchone()
+    if start:
+        db.execute("INSERT OR IGNORE INTO users(user_id, joined_at) VALUES(?,?)", (uid, iso(now())))
+    if row or start:
+        funnel_reset(uid, (row["source"] if row and row["source"] else FUNNEL_PREFIX))
+    db.execute("DELETE FROM crm_messages WHERE user_id=? AND direction='sys'", (uid,))
+    db.execute("UPDATE crm_leads SET stage='auto', trashed_at=0, purged_at=0, summary=NULL WHERE user_id=?", (uid,))
+    db.execute("INSERT INTO crm_messages(user_id, direction, text, ts) VALUES(?,?,?,?)",
+               (uid, "sys", "🔄 Воронка сброшена на нулевой шаг", int(time.time())))
+    db.commit()
+    crm_forget_state(uid)
+    if start:
+        await fx_begin(uid)
+
+
+async def crm_erase_lead(uid: int):
+    """Полностью удаляет человека из базы и из воронки. Платежи (история денег) остаются.
+    Возвращает текст ошибки или None. Если он напишет снова, начнёт с нулевого шага."""
+    u = db.execute("SELECT blocked FROM users WHERE user_id=?", (uid,)).fetchone()
+    if u and u["blocked"]:
+        return "Он заблокирован: удаление сняло бы блокировку. Сначала разблокируйте (/unblock), потом удаляйте."
+    sub = db.execute("SELECT expires_at, active, method_id FROM users WHERE user_id=?", (uid,)).fetchone()
+    if sub and (sub["active"] or sub["method_id"]):
+        until = f" до {fmt(datetime.fromisoformat(sub['expires_at']))}" if sub["expires_at"] else ""
+        return (f"У него есть действующая подписка{until} или сохранённая карта: удаление сотрёт запись о подписке и "
+                "автоплатёж. Сначала завершите подписку.")
+    t = db.execute("SELECT chat_id, thread_id FROM crm_topics WHERE user_id=?", (uid,)).fetchone()
+    if t:
+        try:
+            await bot.delete_forum_topic(chat_id=t["chat_id"], message_thread_id=t["thread_id"])
+        except Exception:
+            logging.warning("не удалось удалить тему CRM лида %s", uid)
+    for q in ("DELETE FROM crm_messages WHERE user_id=?", "DELETE FROM crm_notes WHERE user_id=?",
+              "DELETE FROM crm_seen WHERE user_id=?", "DELETE FROM crm_topics WHERE user_id=?",
+              "DELETE FROM crm_out WHERE user_id=?", "DELETE FROM crm_leads WHERE user_id=?",
+              "DELETE FROM crm_profiles WHERE user_id=?", "DELETE FROM funnel_users WHERE user_id=?",
+              "DELETE FROM support_links WHERE user_id=?", "DELETE FROM help WHERE user_id=?",
+              "DELETE FROM users WHERE user_id=?"):
+        db.execute(q, (uid,))
+    db.commit()
+    crm_forget_state(uid)
+    return None
 
 
 async def check_series():
@@ -3280,6 +3422,18 @@ async def api_del(data):
     return {"ok": True}
 
 
+async def api_reset(data):
+    uid = ADMIN_ID if data.get("self") else int(data["id"])
+    await crm_reset_lead(uid, start=(uid == ADMIN_ID))
+    return {"ok": True, "started": uid == ADMIN_ID}
+
+
+async def api_erase(data):
+    uid = ADMIN_ID if data.get("self") else int(data["id"])
+    err = await crm_erase_lead(uid)
+    return {"ok": not err, "error": err}
+
+
 async def api_note(data):
     uid, text = int(data["id"]), (data.get("text") or "").strip()
     if text:
@@ -3339,7 +3493,7 @@ def crm_web_routes(app: web.Application):
     app.router.add_get("/", crm_index)
     app.router.add_get("/app", crm_index)
     app.router.add_get("/health", crm_health)
-    for name, fn in (("leads", api_leads), ("lead", api_lead), ("send", api_send), ("pay", api_pay), ("del", api_del),
+    for name, fn in (("leads", api_leads), ("lead", api_lead), ("send", api_send), ("pay", api_pay), ("del", api_del), ("reset", api_reset), ("erase", api_erase),
                      ("note", api_note), ("note_del", api_note_del), ("stage", api_stage),
                      ("settings", api_settings)):
         app.router.add_post(f"/api/{name}", crm_api(fn))
@@ -3390,6 +3544,8 @@ async def main():
         BotCommand(command="unblock", description="Снять блокировку пользователя"),
         BotCommand(command="app", description="CRM-мини-апп"),
         BotCommand(command="links", description="Ссылки на воронку по источникам"),
+        BotCommand(command="reset", description="Сбросить воронку (себе, id или @ник)"),
+        BotCommand(command="erase", description="Удалить человека из базы (себя, id или @ник)"),
         BotCommand(command="crm_topics", description="Вкл/выкл CRM в топиках"),
     ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     if MINIAPP_ENABLED and MINIAPP_URL.startswith("https://"):
