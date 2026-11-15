@@ -54,7 +54,7 @@ WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "0"))    # 0 = вебхук вык�
 RETURN_URL = os.getenv("RETURN_URL", "https://t.me/")
 # --- CRM-мини-апп (Telegram Web App на этом же сервере) ---
 MINIAPP_ENABLED = os.getenv("MINIAPP", "1") == "1"
-MINIAPP_URL = (os.getenv("MINIAPP_URL") or "https://bot-1794299880-3352-adminhabirov.bothost.tech").rstrip("/")
+MINIAPP_URL = (os.getenv("MINIAPP_URL") or "").rstrip("/")   # адрес из вкладки «Домен» в Bothost, с https://
 # Порт должен совпадать с «Порт веб-приложения» на вкладке «Домен» в Bothost (там 3000).
 WEB_PORT = int(os.getenv("PORT") or 3000) if MINIAPP_ENABLED else WEBHOOK_PORT
 # --- Автоочистка CRM (дни; можно менять переменными в Bothost) ---
@@ -1480,6 +1480,10 @@ async def cmd_reset(m: Message, command: CommandObject):
     if uid is None:
         await m.answer("Не нашёл такого человека. Укажите id или @ник, либо отправьте команду в его теме.")
         return
+    await crm_do_reset(m, uid)
+
+
+async def crm_do_reset(m: Message, uid: int):
     await crm_reset_lead(uid, start=(uid == ADMIN_ID))
     if uid == ADMIN_ID:
         await m.answer("🔄 Ваша воронка сброшена, начинаем с нулевого шага 👆")
@@ -1495,6 +1499,10 @@ async def cmd_erase(m: Message, command: CommandObject):
     if uid is None:
         await m.answer("Не нашёл такого человека. Укажите id или @ник, либо отправьте команду в его теме.")
         return
+    await crm_ask_erase(m, uid)
+
+
+async def crm_ask_erase(m: Message, uid: int):
     await m.answer(
         f"Удалить из базы <b>{html.escape(crm_display_name(uid))}</b> (id <code>{uid}</code>)?\n"
         "Пропадут переписка, заметки, воронка и запись о нём. Платежи останутся в истории. "
@@ -1614,6 +1622,10 @@ async def crm_group_message(m: Message):
             await crm_send_pay(m, uid, parts[1].strip() if len(parts) > 1 else "")
         elif cmd == "/del":  # реплаем на своё сообщение: удалить его у пользователя
             await crm_delete(m, uid)
+        elif cmd == "/reset":  # сбросить воронку этого человека на нулевой шаг
+            await crm_do_reset(m, uid)
+        elif cmd == "/erase":  # удалить этого человека из базы (с подтверждением)
+            await crm_ask_erase(m, uid)
         return
     try:
         sent = await bot.copy_message(uid, m.chat.id, m.message_id)
@@ -1667,10 +1679,7 @@ FX_QUESTIONS = [
 ]
 FX_Q_SHORT = ["Что происходит в жизни", "Что сложнее всего принять", "Где действует не так, как хочет",
               "Каким хочет стать", "Что уже предпринимал и чего не хватает"]
-FX_MIN_CHARS = int(os.getenv("FUNNEL_MIN_CHARS", "150"))        # минимум символов в ответе на вопрос (≈ три предложения)
-FX_MIN_CHARS_FB = int(os.getenv("FUNNEL_MIN_CHARS_FB", "60"))   # минимум для рассказа «что понравилось»
-FX_TOO_SHORT = ("Расскажите чуть подробнее 🙏 Здесь важна глубина: нужно не менее трёх предложений "
-                "(хотя бы {need} символов). Сейчас: {have}.")
+# Ограничений по длине ответов нет: просьба о трёх предложениях только в тексте вопроса, бот ничего не отклоняет.
 FX_TEXT_ONLY = "Пожалуйста, напишите ответ текстом 🙏"
 FX_LESSON2_CAPTION = ("🎁 <b>Ваш подарок за ответы</b>\nУрок о том, как найти у себя те качества, "
                       "которые ушли в тень.\n\nЗавтра я вам напишу 🤝")
@@ -1691,10 +1700,30 @@ FX_DELAY_2_H = float(os.getenv("FUNNEL_DELAY_2_H", "24"))  # через скол
 FX_V2_STAGES = ("pick", "wait1", "offer", "qa", "wait2", "fb", "fbreason", "fbtext", "closed")
 
 
-def fx_video_ref(n: int) -> str:
-    """Видео урока n: file_id из базы (админ присылает видео боту с подписью 1 или 2) либо переменная FUNNEL_VIDEO_n."""
-    r = db.execute("SELECT v FROM meta WHERE k=?", (f"funnel_video_{n}",)).fetchone()
-    return ((r["v"] if r else "") or os.getenv(f"FUNNEL_VIDEO_{n}", "") or (FUNNEL_VIDEO if n == 1 else "")).strip()
+def fx_video_ref(key) -> str:
+    """Видео по слоту: "1", "2"... (номер бесплатного урока в FX_LESSONS) или "gift" (подарок после ответов).
+    file_id берётся из базы (админ присылает видео боту с подписью) либо из переменной FUNNEL_VIDEO_<слот>."""
+    key = str(key)
+
+    def one(k):
+        r = db.execute("SELECT v FROM meta WHERE k=?", (f"funnel_video_{k}",)).fetchone()
+        return (r["v"] if r else "") or os.getenv(f"FUNNEL_VIDEO_{k.upper()}", "")
+    v = one(key)
+    if not v and key == "gift" and len(FX_LESSONS) == 1:  # раньше подарок хранился как «2»
+        v = one("2")
+    if not v and key == "1":
+        v = FUNNEL_VIDEO
+    return v.strip()
+
+
+def fx_video_label(key) -> str:
+    key = str(key)
+    if key == "gift":
+        return "подарка (урок после ответов на вопросы)"
+    try:
+        return f"урока {key} («{FX_LESSONS[int(key) - 1][1]}»)"
+    except (ValueError, IndexError):
+        return f"урока {key}"
 
 
 def fx_log(uid: int, text: str):
@@ -1720,7 +1749,7 @@ async def fx_send(uid: int, text: str, kb=None) -> bool:
         return False
 
 
-async def fx_send_lesson(uid: int, n: int, caption: str):
+async def fx_send_lesson(uid: int, n, caption: str):
     v = fx_video_ref(n)
     if v and not v.startswith("http"):
         try:
@@ -1729,7 +1758,8 @@ async def fx_send_lesson(uid: int, n: int, caption: str):
         except Exception:
             logging.exception("воронка: не удалось отправить видео урока %s", n)
     if not v:
-        await safe_send(ADMIN_ID, f"⚠️ Не задано видео урока {n}. Отправьте видео этому боту с подписью «{n}».")
+        await safe_send(ADMIN_ID, f"⚠️ Не задано видео {fx_video_label(n)}. Отправьте видео этому боту с подписью "
+                                  f"«{'подарок' if str(n) == 'gift' else n}».")
     await bot.send_message(uid, caption + (f"\n\n{v}" if v.startswith("http") else "\n\n(видео скоро добавлю)"))
 
 
@@ -1797,7 +1827,7 @@ async def fx_qa_finished(uid: int):
     a["t_lesson2"] = t
     fx_save(uid, a, stage="wait2", next_at=t + int(FX_DELAY_2_H * 3600), step=len(FX_QUESTIONS))
     fx_log(uid, "Ответил на все 5 вопросов, отправил урок 2")
-    await fx_send_lesson(uid, 2, FX_LESSON2_CAPTION)
+    await fx_send_lesson(uid, "gift", FX_LESSON2_CAPTION)
 
 
 async def fx_send_offer(uid: int):
@@ -1892,11 +1922,6 @@ async def fx_text(m: Message, row) -> bool:
         await m.answer(FX_TEXT_ONLY)
         return True
     text = m.text.strip()
-    need = FX_MIN_CHARS if stage == "qa" else (FX_MIN_CHARS_FB if stage == "fbtext" else 3)
-    if len(text) < need:
-        await m.answer(FX_TOO_SHORT.format(need=need, have=len(text)) if stage != "fbreason"
-                       else "Напишите, пожалуйста, хотя бы пару слов 🙏")
-        return True
     fx_log_in(uid, m)
     if stage == "qa":
         step = row["step"]
@@ -1939,7 +1964,7 @@ async def fx_callback(cb: CallbackQuery):
         fx_save(uid, a, stage="wait1", next_at=t + int(FX_DELAY_1_H * 3600))
         await funnel_clear_buttons(cb)
         fx_log(uid, f"Отправил бесплатный урок «{name}»")
-        await fx_send_lesson(uid, 1, FX_LESSON1_CAPTION.format(name=html.escape(name)))
+        await fx_send_lesson(uid, str(int(parts[2]) + 1), FX_LESSON1_CAPTION.format(name=html.escape(name)))
         await bot.send_message(uid, FX_TOMORROW)
     elif act == "yes" and stage == "offer":
         await funnel_clear_buttons(cb)
@@ -1986,6 +2011,17 @@ async def fx_callback(cb: CallbackQuery):
         await bot.send_message(uid, *fx_m_closed()[:1], reply_markup=fx_m_closed()[1])
 
 
+@dp.message(Command("videos"), F.from_user.id == ADMIN_ID, F.chat.type == "private")
+async def cmd_videos(m: Message):
+    """Какие видео воронки заданы."""
+    lines = ["🎬 <b>Видео воронки</b>", ""]
+    for i, (_, name) in enumerate(FX_LESSONS):
+        lines.append(f"{'✅' if fx_video_ref(str(i + 1)) else '❌'} Урок {i + 1}: {html.escape(name)}")
+    lines.append(f"{'✅' if fx_video_ref('gift') else '❌'} Подарок (урок после ответов на вопросы)")
+    lines += ["", "Задать или заменить: отправьте боту видео с подписью: номер урока (1, 2...) или слово «подарок»."]
+    await m.answer("\n".join(lines))
+
+
 @dp.message(Command("fskip"), F.from_user.id == ADMIN_ID, F.chat.type == "private")
 async def cmd_fskip(m: Message):
     """Для проверки воронки: не ждать сутки, сразу выполнить ожидающий шаг (свой тестовый проход)."""
@@ -1999,14 +2035,24 @@ async def cmd_fskip(m: Message):
 
 @dp.message(F.from_user.id == ADMIN_ID, F.chat.type == "private", F.video)
 async def funnel_video_id(m: Message):
-    """Видео с подписью 1 или 2: сохраняется как видео урока 1 или 2 воронки. Без подписи: показывает file_id."""
-    cap = (m.caption or "").strip()
-    if cap in ("1", "2"):
-        db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (f"funnel_video_{cap}", m.video.file_id))
+    """Видео с подписью: номер урока (1, 2...) или «подарок» сохраняется в воронку. Без подписи: показывает file_id."""
+    cap = (m.caption or "").strip().lower()
+    key = None
+    if cap in ("подарок", "gift"):
+        key = "gift"
+    elif cap.isdigit():
+        n = int(cap)
+        if n == 2 and len(FX_LESSONS) == 1:  # урок в списке один, значит «2» = подарок (как было раньше)
+            key = "gift"
+        elif 1 <= n <= len(FX_LESSONS):
+            key = str(n)
+    if key:
+        db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (f"funnel_video_{key}", m.video.file_id))
         db.commit()
-        await m.answer(f"✅ Видео урока {cap} сохранено. Новые лиды получат именно его.")
+        await m.answer(f"✅ Видео {fx_video_label(key)} сохранено. Новые лиды получат именно его.")
         return
-    await m.answer(f"Чтобы сохранить как урок, отправьте это видео с подписью 1 или 2.\n")
+    await m.answer("Чтобы сохранить видео в воронку, отправьте его с подписью: номер урока (1, 2...) "
+                   "или слово «подарок». Список заданных видео: /videos")
     await m.answer(f"file_id видео (вставьте в переменную FUNNEL_VIDEO):\n<code>{m.video.file_id}</code>")
 
 
@@ -3262,6 +3308,14 @@ async def crm_fill_names(ids):
     db.commit()
 
 
+def crm_copy_text(lead: dict, prof: dict) -> str:
+    """Только вопросы, на которые отвечал человек, и его ответы: без имени, источника и оценок."""
+    lines = []
+    for x in prof.get("copy_qa") or prof["qa"]:
+        lines += [f"Вопрос: {x['q']}", f"Ответ: {x['a']}", ""]
+    return "\n".join(lines).strip()
+
+
 def crm_profile(f):
     if not f:
         return None
@@ -3276,6 +3330,12 @@ def crm_profile(f):
             qa.append({"q": "Что особенно понравилось", "a": a["fb_text"]})
         prof = {"qa": qa, "done": bool(f["done"]), "source": funnel_source_label(f["source"]),
                 "stage": FUNNEL_STAGE_NAMES.get(f["stage"], f["stage"])}
+        cq = [{"q": t[0], "a": a[f"q{i + 1}"]} for i, t in enumerate(FX_QUESTIONS) if a.get(f"q{i + 1}")]
+        if a.get("fb_reason"):
+            cq.append({"q": "Почему вы не получили ценность?", "a": a["fb_reason"]})
+        if a.get("fb_text"):
+            cq.append({"q": "Что вам особенно понравилось?", "a": a["fb_text"]})
+        prof["copy_qa"] = cq
         if f["done"]:
             prof.update(segment="🟢 Готов к работе", product="индивидуальное предложение, подарок и подписка «Круг»")
         return prof
@@ -3366,6 +3426,8 @@ async def api_lead(data):
     res = {"lead": crm_build(uid, u, f, nm["name"] if nm else None, lead, last, 0), "messages": msgs, "notes": notes}
     if not data.get("light"):
         res["profile"] = crm_profile(f)
+        if res["profile"]:
+            res["profile"]["copy"] = crm_copy_text(res["lead"], res["profile"])
     return res
 
 
@@ -3544,6 +3606,7 @@ async def main():
         BotCommand(command="unblock", description="Снять блокировку пользователя"),
         BotCommand(command="app", description="CRM-мини-апп"),
         BotCommand(command="links", description="Ссылки на воронку по источникам"),
+        BotCommand(command="videos", description="Какие видео воронки заданы"),
         BotCommand(command="reset", description="Сбросить воронку (себе, id или @ник)"),
         BotCommand(command="erase", description="Удалить человека из базы (себя, id или @ник)"),
         BotCommand(command="crm_topics", description="Вкл/выкл CRM в топиках"),

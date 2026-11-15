@@ -135,6 +135,16 @@ function fmtTime(ts) {
     : d.toLocaleDateString('ru-RU', {day:'2-digit', month:'2-digit'});
 }
 const fmtFull = ts => new Date(ts * 1000).toLocaleString('ru-RU', {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'});
+function copyText(t) {
+  const done = () => toast('Ответы скопированы. Можно вставлять.');
+  const fallback = () => {
+    const ta = document.createElement('textarea'); ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    let ok = false; try { ok = document.execCommand('copy'); } catch (e) {}
+    ta.remove(); ok ? done() : toast('Не удалось скопировать автоматически.');
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(done, fallback); else fallback();
+}
 function ask(text, ok) {
   if (tg && tg.showConfirm) tg.showConfirm(text, y => { if (y) ok(); }); else if (confirm(text)) ok();
 }
@@ -401,6 +411,7 @@ function drawProfile() {
   <h3>Профиль из теста</h3>` + (p ? `
     ${p.segment ? `<div class="card"><b>${esc(p.segment)}</b><div class="hint">${[p.product && 'Рекомендуемый продукт: ' + esc(p.product), p.direction && 'Направление: ' + esc(p.direction), p.problems && 'Доп. проблемы: ' + esc(p.problems)].filter(Boolean).join('<br>')}</div></div>` : `<div class="hint">Тест не завершён, этап: ${esc(p.stage)}</div>`}
     <div class="hint" style="margin-top:8px">Источник: ${esc(p.source || '—')}</div>
+    <button class="btn" id="cpa" style="width:100%;margin-top:8px">📋 Скопировать все ответы</button>
     ${p.qa.map(x => `<div class="qa"><small>${esc(x.q)}</small>${esc(x.a)}</div>`).join('')}
     ${p.resume ? `<h3>Резюме</h3><div class="card">${esc(p.resume)}</div>` : ''}` : '<div class="hint">Этот человек не проходил воронку.</div>') + `
   <h3>Управление</h3>
@@ -408,6 +419,7 @@ function drawProfile() {
     <button class="btn ghost" id="rst" style="width:100%">🔄 Сбросить воронку на нулевой шаг</button>
     <button class="btn ghost" id="ers" style="width:100%;margin-top:8px;color:var(--bad)">🗑 Удалить из базы</button></div>`;
   document.querySelectorAll('#stp .pill').forEach(p => p.onclick = () => setStage(p.dataset.k));
+  if ($('#cpa')) $('#cpa').onclick = () => copyText(S.data.profile.copy);
   $('#rst').onclick = () => ask('Сбросить воронку этого человека на нулевой шаг? Ему ничего не отправится: когда он снова откроет ссылку воронки, начнёт сначала. Серые события и стадия сбросятся, переписка и заметки останутся.', async () => {
     const r = await api('reset', {id:S.cur}); if (!r.ok) return toast(r.error);
     S.data = await api('lead', {id:S.cur}); updHead(); drawProfile(); toast('Воронка сброшена на нулевой шаг.');
