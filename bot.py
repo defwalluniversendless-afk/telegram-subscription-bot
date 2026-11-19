@@ -44,7 +44,11 @@ PRICE = float(os.getenv("PRICE", "2500"))         # цена за период, 
 PERIOD_DAYS = float(os.getenv("PERIOD_DAYS", "30"))
 REMIND_DAYS = float(os.getenv("REMIND_DAYS", "3"))    # за сколько дней напоминать о продлении
 STUCK_HOURS = float(os.getenv("STUCK_HOURS", "24"))   # через сколько часов напомнить «застрявшему» на оплате
-OFFER_URL = os.getenv("OFFER_URL") or "https://disk.yandex.ru/d/E2dDsFUW5SX4mQ"  # ссылка на публичную оферту
+DOCS_URL = "http://docs.habirovcyrcle.online"
+OFFER_URL = os.getenv("OFFER_URL") or f"{DOCS_URL}/offer/"  # ссылка на публичную оферту (показывается перед оплатой)
+CONSENT_URL = f"{DOCS_URL}/consent/"   # согласие на обработку персональных данных
+PRIVACY_URL = f"{DOCS_URL}/privacy/"   # политика обработки персональных данных
+ADS_URL = f"{DOCS_URL}/ads/"           # согласие на рекламную рассылку
 AUTOCHARGE = os.getenv("AUTOCHARGE", "0") == "1"  # автосписание (нужно включить у ЮKassa)
 TEST_MODE = os.getenv("TEST_MODE", "0") == "1"    # 1 = локальная имитация оплаты без ЮKassa
 PAYMENT_STORE_MODE = os.getenv("PAYMENT_STORE_MODE", "test").lower()
@@ -67,6 +71,7 @@ DATA_DIR = os.getenv("DATA_DIR") or ("/app/data" if os.path.isdir("/app/data") e
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "bot.db")
 PAYMENT_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Inter.png")
+WELCOME_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "welcome.png")  # картинка «добро пожаловать в круг»
 BACKUP_HOURS = float(os.getenv("BACKUP_HOURS", "24"))  # как часто бот присылает вам копию базы
 # --- воронка из Instagram ---
 FUNNEL_PREFIX = os.getenv("FUNNEL_PAYLOAD_PREFIX", "insta")        # ссылка вида t.me/бот?start=insta
@@ -80,6 +85,16 @@ T_WELCOME = ("Привет, я бот Круга Ильи Хабирова. Я �
 T_PRODUCT = ("📚 <b>Ежемесячная подписка на закрытый канал с лекциями</b>\n"
              "Цена: <b>{price} ₽</b> в месяц\n\n"
              "Перед оплатой ознакомьтесь с {offer}.")
+T_CONSENT = (
+    "<b>Добро пожаловать в круг</b>\n\n"
+    "Чтобы запустить бота, нажмите на кнопку «Соглашаюсь».\n\n"
+    "Нажимая на кнопку, вы даёте <a href=\"{consent}\">согласие на обработку персональных данных</a> "
+    "в соответствии с <a href=\"{privacy}\">политикой обработки персональных данных</a>, "
+    "а также даёте согласие на получение информационных уведомлений и "
+    "<a href=\"{ads}\">рекламной рассылки</a>.\n\n"
+    "Просто нажмите кнопку «Соглашаюсь», чтобы продолжить."
+)
+T_CONSENT_BTN = "Соглашаюсь"
 T_WHAT_YOU_GET = (
     "Приобретая подписку в «Круге», вы получаете доступ к ежемесячно обновляемому "
     "Telegram-каналу с лекциями и статьями о духовном и личностном развитии. "
@@ -175,6 +190,10 @@ def migrate():
                       ("joined_at", "TEXT"), ("blocked", "INTEGER DEFAULT 0")):
         if name not in cols:
             db.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
+    if "consent_at" not in cols:  # когда человек нажал «Соглашаюсь»
+        db.execute("ALTER TABLE users ADD COLUMN consent_at TEXT")
+    if "start_payload" not in cols:  # параметр ссылки, с которой человек пришёл (пока не согласился)
+        db.execute("ALTER TABLE users ADD COLUMN start_payload TEXT")
     if "method_mode" not in cols:
         db.execute("ALTER TABLE users ADD COLUMN method_mode TEXT")
     if "grace_until" not in cols:
@@ -687,30 +706,95 @@ async def set_subscription_days(uid: int, days: float):
 
 
 # ---------- Воронка: /start -> оплата ----------
+def has_consent(uid: int) -> bool:
+    row = db.execute("SELECT consent_at FROM users WHERE user_id=?", (uid,)).fetchone()
+    return bool(row and row["consent_at"])
+
+
+async def send_consent(uid: int, username: str | None, payload: str = ""):
+    """Первый экран: картинка + согласие на обработку данных и рассылку. Дальше только по кнопке «Соглашаюсь»."""
+    ensure_user(uid, username)
+    db.execute("UPDATE users SET start_payload=? WHERE user_id=?", (payload or "", uid))
+    db.commit()
+    text = T_CONSENT.format(consent=CONSENT_URL, privacy=PRIVACY_URL, ads=ADS_URL)
+    kb = markup([btn(T_CONSENT_BTN, "agree")])
+    if os.path.isfile(WELCOME_IMAGE_PATH):
+        await bot.send_photo(uid, FSInputFile(WELCOME_IMAGE_PATH), caption=text, reply_markup=kb)
+    else:
+        logging.error("Картинка приветствия не найдена: %s", WELCOME_IMAGE_PATH)
+        await safe_send(ADMIN_ID, f"⚠️ Не найден файл картинки приветствия: <code>{html.escape(WELCOME_IMAGE_PATH)}</code>")
+        await bot.send_message(uid, text, reply_markup=kb)
+
+
+async def continue_start(user, payload: str):
+    """То, что раньше происходило сразу на /start. Вызывается после согласия (или если согласие уже есть)."""
+    uid = user.id
+    if payload == "__buy__":  # человек нажал «Оплатить» до согласия
+        await show_product(uid, user.username)
+        return
+    if funnel_source_id(payload) and not active_subscription(uid):
+        await funnel_start(user, payload)  # пришёл по ссылке из Instagram, YouTube и т.п. -> воронка
+        return
+    ensure_user(uid, user.username)
+    u = db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    if active_subscription(uid):
+        await bot.send_message(uid, T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))), reply_markup=KB_HELP)
+        return
+    if maintenance_enabled() and uid != ADMIN_ID:
+        await bot.send_message(uid, maintenance_message(), reply_markup=maintenance_keyboard())
+        return
+    await bot.send_message(uid, T_WELCOME, reply_markup=KB_START)
+
+
 @dp.message(Command("start", "join"))
 async def start(m: Message, command: CommandObject):
     payload = (command.args or "").strip()
-    if funnel_source_id(payload) and not active_subscription(m.from_user.id):
-        await funnel_start(m, payload)  # пришёл по ссылке из Instagram, YouTube и т.п. -> воронка
+    uid = m.from_user.id
+    if not active_subscription(uid) and not has_consent(uid):
+        await send_consent(uid, m.from_user.username, payload)  # сначала согласие, воронка и оплата только после него
         return
-    ensure_user(m.from_user.id, m.from_user.username)
-    u = db.execute("SELECT * FROM users WHERE user_id=?", (m.from_user.id,)).fetchone()
-    if active_subscription(m.from_user.id):
-        await m.answer(T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))), reply_markup=KB_HELP)
-        return
-    if maintenance_enabled() and m.from_user.id != ADMIN_ID:
-        await m.answer(maintenance_message(), reply_markup=maintenance_keyboard())
-        return
-    await m.answer(T_WELCOME, reply_markup=KB_START)
+    await continue_start(m.from_user, payload)
+
+
+@dp.callback_query(F.data == "agree")
+async def agree(cb: CallbackQuery):
+    uid = cb.from_user.id
+    ensure_user(uid, cb.from_user.username)
+    row = db.execute("SELECT consent_at, start_payload FROM users WHERE user_id=?", (uid,)).fetchone()
+    payload = (row["start_payload"] or "") if row else ""
+    first_time = not (row and row["consent_at"])
+    if first_time:
+        db.execute("UPDATE users SET consent_at=? WHERE user_id=?", (iso(now()), uid))
+        db.commit()
+        try:
+            crm_sys(uid, "✅ Согласился на обработку персональных данных и рассылку")
+        except Exception:
+            logging.exception("не удалось записать согласие в CRM")
+    await cb.answer()
+    try:  # убираем кнопку, чтобы не нажимали дважды
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if first_time:
+        await continue_start(cb.from_user, payload)
 
 
 @dp.callback_query(F.data == "buy")
 async def buy(cb: CallbackQuery):
     uid = cb.from_user.id
     ensure_user(uid, cb.from_user.username)
-    if maintenance_enabled() and uid != ADMIN_ID:
-        await cb.message.answer(maintenance_message(), reply_markup=maintenance_keyboard())
+    if not active_subscription(uid) and not has_consent(uid):
+        await send_consent(uid, cb.from_user.username, "__buy__")  # без согласия к оплате не пускаем
         await cb.answer()
+        return
+    await show_product(uid, cb.from_user.username)
+    await cb.answer()
+
+
+async def show_product(uid: int, username: str | None):
+    ensure_user(uid, username)
+    if maintenance_enabled() and uid != ADMIN_ID:
+        await bot.send_message(uid, maintenance_message(), reply_markup=maintenance_keyboard())
         return
     # человек дошёл до оплаты: запускаем таймер «застрял на оплате»
     db.execute("UPDATE users SET pay_started_at=?, stuck_reminded=0 WHERE user_id=? AND active=0", (iso(now()), uid))
@@ -718,14 +802,11 @@ async def buy(cb: CallbackQuery):
     offer = T_OFFER_LINK.format(url=html.escape(OFFER_URL, quote=True)) if OFFER_URL else T_OFFER_SOON
     text = T_PRODUCT.format(price=f"{PRICE:.0f}", offer=offer) + (T_AUTO_NOTE if AUTOCHARGE else "")
     if os.path.isfile(PAYMENT_IMAGE_PATH):
-        await cb.message.answer_photo(
-            FSInputFile(PAYMENT_IMAGE_PATH), caption=text, reply_markup=KB_PRODUCT()
-        )
+        await bot.send_photo(uid, FSInputFile(PAYMENT_IMAGE_PATH), caption=text, reply_markup=KB_PRODUCT())
     else:
         logging.error("Изображение оплаты не найдено: %s", PAYMENT_IMAGE_PATH)
         await safe_send(ADMIN_ID, f"⚠️ Не найден файл картинки оплаты: <code>{html.escape(PAYMENT_IMAGE_PATH)}</code>")
-        await cb.message.answer(text, reply_markup=KB_PRODUCT())
-    await cb.answer()
+        await bot.send_message(uid, text, reply_markup=KB_PRODUCT())
 
 
 @dp.callback_query(F.data == "payment:details")
@@ -1304,15 +1385,15 @@ async def funnel_send_video(uid: int):
     await bot.send_message(uid, text, reply_markup=kb)
 
 
-async def funnel_start(m: Message, payload: str):
-    uid = m.from_user.id
-    ensure_user(uid, m.from_user.username)
+async def funnel_start(user, payload: str):
+    uid = user.id
+    ensure_user(uid, user.username)
     row = funnel_get(uid)
     if row and funnel_answers(row).get("flow") == "v2" and row["stage"] != "pick":
         await fx_resend(uid, row)  # уже в воронке: повторяем текущий шаг, не начинаем заново
         return
     funnel_reset(uid, payload)
-    await m.answer(FX_GREETING)
+    await bot.send_message(uid, FX_GREETING)
     kb = markup(*[[btn(label, f"fx:l:{i}")] for i, (label, _) in enumerate(FX_LESSONS)])
     await bot.send_message(uid, FX_PICK_Q, reply_markup=kb)
 
