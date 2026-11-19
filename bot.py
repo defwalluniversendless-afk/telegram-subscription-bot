@@ -82,9 +82,11 @@ FUNNEL_SOURCES = {FUNNEL_PREFIX: ("📸", "Instagram"), "yt": ("▶️", "YouTub
 # Разметка: <b>жирный</b>, <i>курсив</i>. Подстановки в {фигурных скобках} не трогайте.
 T_WELCOME = ("Привет, я бот Круга Ильи Хабирова. Я выдаю доступ к закрытому каналу с лекциями.\n"
              "Оплатить можно картой.\n\nЧтобы оплатить, нажмите на кнопку 👇")
-T_PRODUCT = ("📚 <b>Ежемесячная подписка на закрытый канал с лекциями</b>\n"
+T_PRODUCT = ("<b>Ежемесячная подписка</b>\n"
+             "Доступ к регулярно пополняемой платформе с лекциями по самопознанию.\n\n"
              "Цена: <b>{price} ₽</b> в месяц\n\n"
              "Перед оплатой ознакомьтесь с {offer}.")
+T_MENU = "Что вы хотите сделать?"
 T_CONSENT = (
     "<b>Добро пожаловать в круг</b>\n\n"
     "Чтобы запустить бота, нажмите на кнопку «Соглашаюсь».\n\n"
@@ -436,6 +438,9 @@ def markup(*rows) -> InlineKeyboardMarkup:
 
 
 KB_START = markup([btn("💳 Оплатить", "buy")])
+KB_MENU = markup([btn("Оплатить подписку", "buy")],
+                 [btn("Проверить статус подписки", "status")],
+                 [btn("Связаться с поддержкой", "help")])
 KB_RENEW = markup([btn("💳 Продлить подписку", "buy")])
 KB_PAY = lambda: markup([btn(f"💳 Оплатить {PRICE:.0f} ₽", "pay")], [btn("💬 Связаться", "help")])
 KB_PRODUCT = lambda: markup(
@@ -743,7 +748,7 @@ async def continue_start(user, payload: str):
     if maintenance_enabled() and uid != ADMIN_ID:
         await bot.send_message(uid, maintenance_message(), reply_markup=maintenance_keyboard())
         return
-    await bot.send_message(uid, T_WELCOME, reply_markup=KB_START)
+    await bot.send_message(uid, T_MENU, reply_markup=KB_MENU)
 
 
 @dp.message(Command("start", "join"))
@@ -792,21 +797,21 @@ async def buy(cb: CallbackQuery):
 
 
 async def show_product(uid: int, username: str | None):
-    ensure_user(uid, username)
+    if username is not None:  # из CRM ник не передаём, чтобы не затереть его в базе
+        ensure_user(uid, username)
     if maintenance_enabled() and uid != ADMIN_ID:
-        await bot.send_message(uid, maintenance_message(), reply_markup=maintenance_keyboard())
-        return
+        return await bot.send_message(uid, maintenance_message(), reply_markup=maintenance_keyboard())
     # человек дошёл до оплаты: запускаем таймер «застрял на оплате»
     db.execute("UPDATE users SET pay_started_at=?, stuck_reminded=0 WHERE user_id=? AND active=0", (iso(now()), uid))
     db.commit()
     offer = T_OFFER_LINK.format(url=html.escape(OFFER_URL, quote=True)) if OFFER_URL else T_OFFER_SOON
     text = T_PRODUCT.format(price=f"{PRICE:.0f}", offer=offer) + (T_AUTO_NOTE if AUTOCHARGE else "")
     if os.path.isfile(PAYMENT_IMAGE_PATH):
-        await bot.send_photo(uid, FSInputFile(PAYMENT_IMAGE_PATH), caption=text, reply_markup=KB_PRODUCT())
+        return await bot.send_photo(uid, FSInputFile(PAYMENT_IMAGE_PATH), caption=text, reply_markup=KB_PRODUCT())
     else:
         logging.error("Изображение оплаты не найдено: %s", PAYMENT_IMAGE_PATH)
         await safe_send(ADMIN_ID, f"⚠️ Не найден файл картинки оплаты: <code>{html.escape(PAYMENT_IMAGE_PATH)}</code>")
-        await bot.send_message(uid, text, reply_markup=KB_PRODUCT())
+        return await bot.send_message(uid, text, reply_markup=KB_PRODUCT())
 
 
 @dp.callback_query(F.data == "payment:details")
@@ -1393,7 +1398,6 @@ async def funnel_start(user, payload: str):
         await fx_resend(uid, row)  # уже в воронке: повторяем текущий шаг, не начинаем заново
         return
     funnel_reset(uid, payload)
-    await bot.send_message(uid, FX_GREETING)
     kb = markup(*[[btn(label, f"fx:l:{i}")] for i, (label, _) in enumerate(FX_LESSONS)])
     await bot.send_message(uid, FX_PICK_Q, reply_markup=kb)
 
@@ -1627,7 +1631,9 @@ async def crm_send_pay(m: Message, uid: int, custom: str):
                       "Форму оплаты не отправляю.")
         return
     try:
-        sent = await bot.send_message(uid, html.escape(custom) if custom else T_PAY_REQUEST, reply_markup=KB_START)
+        if custom:
+            await bot.send_message(uid, html.escape(custom))
+        sent = await show_product(uid, None)
         crm_out_save(m.chat.id, m.message_id, uid, sent.message_id)
     except Exception:
         logging.exception("не удалось отправить форму оплаты пользователю %s", uid)
@@ -2068,7 +2074,7 @@ async def fx_callback(cb: CallbackQuery):
     elif act == "buy" and stage == "closed":
         await funnel_clear_buttons(cb)
         fx_log(uid, "Человек выбрал «Купить подписку», отправил форму оплаты")
-        await bot.send_message(uid, T_PAY_REQUEST, reply_markup=KB_START)
+        await show_product(uid, None)
     elif act == "v" and stage == "fb":
         await funnel_clear_buttons(cb)
         if parts[2] == "y":
@@ -2342,6 +2348,14 @@ async def status(m: Message):
     ensure_user(m.from_user.id, m.from_user.username)
     text, keyboard = subscription_status(m.from_user.id)
     await m.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "status")
+async def status_btn(cb: CallbackQuery):
+    ensure_user(cb.from_user.id, cb.from_user.username)
+    text, keyboard = subscription_status(cb.from_user.id)
+    await cb.message.answer(text, reply_markup=keyboard)
+    await cb.answer()
 
 
 def admin_menu():
@@ -3180,7 +3194,6 @@ def crm_forget_state(uid: int):
 
 async def fx_begin(uid: int):
     """Первый шаг воронки: приветствие и выбор бесплатного урока."""
-    await bot.send_message(uid, FX_GREETING)
     await bot.send_message(uid, FX_PICK_Q, reply_markup=markup(
         *[[btn(label, f"fx:l:{i}")] for i, (label, _) in enumerate(FX_LESSONS)]))
 
@@ -3534,7 +3547,7 @@ async def api_pay(data):
     if sub:
         return {"ok": False, "error": f"Подписка уже активна до {fmt(datetime.fromisoformat(sub['expires_at']))}."}
     try:
-        sent = await bot.send_message(uid, T_PAY_REQUEST, reply_markup=KB_START)
+        sent = await show_product(uid, None)
     except Exception:
         logging.exception("мини-апп: не удалось отправить форму оплаты %s", uid)
         return {"ok": False, "error": "Не доставлено: пользователь мог заблокировать бота."}
