@@ -3,9 +3,16 @@
 Воронка: /start или /join -> кнопка -> карточка товара + оферта -> оплата -> доступ в канал
 -> напоминания -> (автосписание) -> закрытие доступа. /help — связь с владельцем.
 Все тексты бота лежат в блоке TEXTS ниже: правьте формулировки там.
+
+Воронка из Instagram (в этом же файле, блок FUNNEL): ссылка t.me/бот?start=insta -> вопрос об аудитории
+-> урок -> видео «Что такое Круг» -> тест из 7 вопросов -> профиль приходит администратору
+с кнопкой «Написать ему». Обычный /start работает как раньше.
 """
 import asyncio
+import hashlib
+import hmac
 import html
+import json
 import logging
 import math
 import os
@@ -20,10 +27,12 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (BotCommand, CallbackQuery, FSInputFile, InlineKeyboardButton,
-                           BotCommandScopeChat, InlineKeyboardMarkup, Message)
+                           BotCommandScopeChat, InlineKeyboardMarkup, MenuButtonWebApp, Message,
+                           WebAppInfo)
 from aiohttp import web
+from urllib.parse import parse_qsl
 from dotenv import load_dotenv
 from yookassa import Configuration, Payment, PaymentMethod
 
@@ -35,7 +44,11 @@ PRICE = float(os.getenv("PRICE", "2500"))         # цена за период, 
 PERIOD_DAYS = float(os.getenv("PERIOD_DAYS", "30"))
 REMIND_DAYS = float(os.getenv("REMIND_DAYS", "3"))    # за сколько дней напоминать о продлении
 STUCK_HOURS = float(os.getenv("STUCK_HOURS", "24"))   # через сколько часов напомнить «застрявшему» на оплате
-OFFER_URL = os.getenv("OFFER_URL") or "https://disk.yandex.ru/d/E2dDsFUW5SX4mQ"  # ссылка на публичную оферту
+DOCS_URL = "http://docs.habirovcyrcle.online"
+OFFER_URL = os.getenv("OFFER_URL") or f"{DOCS_URL}/offer/"  # ссылка на публичную оферту (показывается перед оплатой)
+CONSENT_URL = f"{DOCS_URL}/consent/"   # согласие на обработку персональных данных
+PRIVACY_URL = f"{DOCS_URL}/privacy/"   # политика обработки персональных данных
+ADS_URL = f"{DOCS_URL}/ads/"           # согласие на рекламную рассылку
 AUTOCHARGE = os.getenv("AUTOCHARGE", "0") == "1"  # автосписание (нужно включить у ЮKassa)
 TEST_MODE = os.getenv("TEST_MODE", "0") == "1"    # 1 = локальная имитация оплаты без ЮKassa
 PAYMENT_STORE_MODE = os.getenv("PAYMENT_STORE_MODE", "test").lower()
@@ -43,19 +56,51 @@ if PAYMENT_STORE_MODE not in {"test", "live"}:
     raise ValueError("PAYMENT_STORE_MODE должен быть test или live")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "0"))    # 0 = вебхук выключен, только опрос
 RETURN_URL = os.getenv("RETURN_URL", "https://t.me/")
+# --- CRM-мини-апп (Telegram Web App на этом же сервере) ---
+MINIAPP_ENABLED = os.getenv("MINIAPP", "1") == "1"
+MINIAPP_URL = (os.getenv("MINIAPP_URL") or "").rstrip("/")   # адрес из вкладки «Домен» в Bothost, с https://
+# Порт должен совпадать с «Порт веб-приложения» на вкладке «Домен» в Bothost (там 3000).
+WEB_PORT = int(os.getenv("PORT") or 3000) if MINIAPP_ENABLED else WEBHOOK_PORT
+# --- Автоочистка CRM (дни; можно менять переменными в Bothost) ---
+CRM_TRASH_DAYS = int(os.getenv("CRM_TRASH_DAYS", "15"))          # «Не купил / закрыт»: через столько дней данные лида очищаются
+CRM_BUYER_SYS_DAYS = int(os.getenv("CRM_BUYER_SYS_DAYS", "15"))  # у покупателей серые события старше N дней удаляются
+CRM_SYS_DAYS = int(os.getenv("CRM_SYS_DAYS", "90"))              # у остальных серые события старше N дней (0 = не чистить)
+CRM_STALE_DAYS = int(os.getenv("CRM_STALE_DAYS", "0"))           # зашёл, не прошёл тест и молчит N дней: в корзину (0 = выкл.)
 # Папка с базой. На Bothost постоянное хранилище лежит в /app/data (тариф Basic и выше).
 DATA_DIR = os.getenv("DATA_DIR") or ("/app/data" if os.path.isdir("/app/data") else ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "bot.db")
 PAYMENT_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Inter.png")
+WELCOME_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "welcome.png")  # картинка «добро пожаловать в круг»
 BACKUP_HOURS = float(os.getenv("BACKUP_HOURS", "24"))  # как часто бот присылает вам копию базы
+# --- воронка из Instagram ---
+FUNNEL_PREFIX = os.getenv("FUNNEL_PAYLOAD_PREFIX", "insta")        # ссылка вида t.me/бот?start=insta
+# Источники лидов: параметр ссылки -> (значок, название). Ссылка t.me/бот?start=yt = лид из YouTube.
+# К метке можно добавить уточнение: ?start=yt_shadow, в CRM будет «YouTube (shadow)». Новый источник добавьте строкой.
+FUNNEL_SOURCES = {FUNNEL_PREFIX: ("📸", "Instagram"), "yt": ("▶️", "YouTube")}
 # ============================== TEXTS ==============================
 # Разметка: <b>жирный</b>, <i>курсив</i>. Подстановки в {фигурных скобках} не трогайте.
 T_WELCOME = ("Привет, я бот Круга Ильи Хабирова. Я выдаю доступ к закрытому каналу с лекциями.\n"
              "Оплатить можно картой.\n\nЧтобы оплатить, нажмите на кнопку 👇")
-T_PRODUCT = ("📚 <b>Ежемесячная подписка на закрытый канал с лекциями</b>\n"
+T_PRODUCT = ("<b>Ежемесячная подписка</b>\n"
+             "Доступ к регулярно пополняемой платформе с лекциями по самопознанию.\n\n"
              "Цена: <b>{price} ₽</b> в месяц\n\n"
              "Перед оплатой ознакомьтесь с {offer}.")
+T_MENU = "Что вы хотите сделать?"
+T_CONSENT = (
+    "<b>Добро пожаловать в круг</b>\n\n"
+    "Чтобы запустить бота, выберите один из вариантов ниже.\n\n"
+    "<b>«Соглашаюсь»</b>: вы даёте <a href=\"{consent}\">согласие на обработку персональных данных</a> "
+    "в соответствии с <a href=\"{privacy}\">политикой обработки персональных данных</a>, "
+    "а также даёте согласие на получение информационных уведомлений и "
+    "<a href=\"{ads}\">рекламной рассылки</a>.\n\n"
+    "<b>«Соглашаюсь без рассылки»</b>: вы даёте <a href=\"{consent}\">согласие на обработку персональных данных</a> "
+    "в соответствии с <a href=\"{privacy}\">политикой обработки персональных данных</a>, "
+    "но отказываетесь от <a href=\"{ads}\">рекламной рассылки</a>. "
+    "Служебные уведомления (доступ, оплата, напоминания о подписке) вы будете получать в любом случае."
+)
+T_CONSENT_BTN = "Соглашаюсь"
+T_CONSENT_BTN_NOADS = "Соглашаюсь без рассылки"
 T_WHAT_YOU_GET = (
     "Приобретая подписку в «Круге», вы получаете доступ к ежемесячно обновляемому "
     "Telegram-каналу с лекциями и статьями о духовном и личностном развитии. "
@@ -123,6 +168,23 @@ CREATE TABLE IF NOT EXISTS support_links(
   chat_id INTEGER, message_id INTEGER, user_id INTEGER,
   PRIMARY KEY(chat_id, message_id));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS funnel_users(
+  user_id INTEGER PRIMARY KEY, source TEXT, answers TEXT DEFAULT '{}', stage TEXT DEFAULT 'group',
+  step INTEGER DEFAULT 0, tmp TEXT DEFAULT '[]', done INTEGER DEFAULT 0, created INTEGER);
+CREATE TABLE IF NOT EXISTS crm_topics(user_id INTEGER PRIMARY KEY, chat_id INTEGER, thread_id INTEGER);
+CREATE TABLE IF NOT EXISTS crm_out(
+  chat_id INTEGER, message_id INTEGER, user_id INTEGER, user_message_id INTEGER,
+  PRIMARY KEY(chat_id, message_id));
+CREATE TABLE IF NOT EXISTS crm_messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, direction TEXT, text TEXT, ts INTEGER);
+CREATE TABLE IF NOT EXISTS crm_notes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, ts INTEGER);
+CREATE TABLE IF NOT EXISTS crm_leads(user_id INTEGER PRIMARY KEY, stage TEXT DEFAULT 'new', amount REAL, updated INTEGER);
+CREATE TABLE IF NOT EXISTS crm_seen(user_id INTEGER PRIMARY KEY, ts INTEGER);
+CREATE TABLE IF NOT EXISTS crm_profiles(user_id INTEGER PRIMARY KEY, name TEXT);
+CREATE INDEX IF NOT EXISTS idx_crm_msg_user ON crm_messages(user_id, id);
+CREATE INDEX IF NOT EXISTS idx_crm_notes_user ON crm_notes(user_id);
+CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id);
 """
 
 
@@ -134,6 +196,12 @@ def migrate():
                       ("joined_at", "TEXT"), ("blocked", "INTEGER DEFAULT 0")):
         if name not in cols:
             db.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
+    if "consent_at" not in cols:  # когда человек нажал «Соглашаюсь»
+        db.execute("ALTER TABLE users ADD COLUMN consent_at TEXT")
+    if "ads_optout" not in cols:  # 1 = согласился на обработку данных, но отказался от рекламной рассылки
+        db.execute("ALTER TABLE users ADD COLUMN ads_optout INTEGER DEFAULT 0")
+    if "start_payload" not in cols:  # параметр ссылки, с которой человек пришёл (пока не согласился)
+        db.execute("ALTER TABLE users ADD COLUMN start_payload TEXT")
     if "method_mode" not in cols:
         db.execute("ALTER TABLE users ADD COLUMN method_mode TEXT")
     if "grace_until" not in cols:
@@ -146,6 +214,26 @@ def migrate():
     pending_method_cols = {r["name"] for r in db.execute("PRAGMA table_info(pending_methods)")}
     if "store_mode" not in pending_method_cols:
         db.execute("ALTER TABLE pending_methods ADD COLUMN store_mode TEXT")
+    funnel_cols = {r["name"] for r in db.execute("PRAGMA table_info(funnel_users)")}
+    if "stage" not in funnel_cols:
+        db.execute("ALTER TABLE funnel_users ADD COLUMN stage TEXT DEFAULT 'group'")
+    if "tmp" not in funnel_cols:
+        db.execute("ALTER TABLE funnel_users ADD COLUMN tmp TEXT DEFAULT '[]'")
+    if "done_at" not in funnel_cols:  # когда закончил тест (0 = старые лиды: серия им не шлётся)
+        db.execute("ALTER TABLE funnel_users ADD COLUMN done_at INTEGER DEFAULT 0")
+    if "series_idx" not in funnel_cols:  # сколько писем серии уже отправлено
+        db.execute("ALTER TABLE funnel_users ADD COLUMN series_idx INTEGER DEFAULT 0")
+    if "next_at" not in funnel_cols:  # когда сработает таймер следующего шага воронки
+        db.execute("ALTER TABLE funnel_users ADD COLUMN next_at INTEGER DEFAULT 0")
+    cm_cols = {r[1] for r in db.execute("PRAGMA table_info(crm_messages)")}
+    if "tg_id" not in cm_cols:  # номер сообщения в Telegram: нужен, чтобы удалять сообщение у человека
+        db.execute("ALTER TABLE crm_messages ADD COLUMN tg_id INTEGER DEFAULT 0")
+    if "deleted" not in cm_cols:
+        db.execute("ALTER TABLE crm_messages ADD COLUMN deleted INTEGER DEFAULT 0")
+    cl_cols = {r[1] for r in db.execute("PRAGMA table_info(crm_leads)")}
+    for col, ddl in (("trashed_at", "INTEGER DEFAULT 0"), ("purged_at", "INTEGER DEFAULT 0"), ("summary", "TEXT")):
+        if col not in cl_cols:  # корзина и справка после очистки
+            db.execute(f"ALTER TABLE crm_leads ADD COLUMN {col} {ddl}")
     db.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('payment_store_mode',?)", (PAYMENT_STORE_MODE,))
     db.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('maintenance_mode','1')")
     db.execute(
@@ -184,6 +272,35 @@ class BlockedUserMiddleware(BaseMiddleware):
 
 dp.message.outer_middleware(BlockedUserMiddleware())
 dp.callback_query.outer_middleware(BlockedUserMiddleware())
+
+
+class CrmEventLogMiddleware(BaseMiddleware):
+    """Пишет в CRM, на какие кнопки человек нажимает и какие команды запускает (серые строки в чате мини-аппа)."""
+    async def __call__(self, handler, event, data):
+        try:
+            u = event.from_user
+            if u and u.id != ADMIN_ID:
+                if isinstance(event, CallbackQuery):
+                    msg = event.message
+                    label = None
+                    for kb_row in (getattr(getattr(msg, "reply_markup", None), "inline_keyboard", None) or []):
+                        for b in kb_row:
+                            if b.callback_data == event.data:
+                                label = b.text
+                    lines = ((getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip().splitlines())
+                    hint = lines[0][:60] if lines else ""
+                    crm_remember_name(u)
+                    crm_sys(u.id, f"🔘 Нажал «{label or event.data}»" + (f"\nпод сообщением: «{hint}»" if hint else ""))
+                elif isinstance(event, Message) and event.text and event.text.startswith("/"):
+                    crm_remember_name(u)
+                    crm_sys(u.id, f"⌨️ Команда {event.text[:80]}")
+        except Exception:
+            logging.exception("не удалось записать событие в CRM")
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(CrmEventLogMiddleware())
+dp.callback_query.outer_middleware(CrmEventLogMiddleware())
 
 awaiting_help: set[int] = set()  # кто сейчас пишет вопрос администратору
 awaiting_custom_days: dict[int, tuple[int, int, int, int]] = {}  # user_id, страница, панель, запрос срока
@@ -327,6 +444,9 @@ def markup(*rows) -> InlineKeyboardMarkup:
 
 
 KB_START = markup([btn("💳 Оплатить", "buy")])
+KB_MENU = markup([btn("Оплатить подписку", "buy")],
+                 [btn("Проверить статус подписки", "status")],
+                 [btn("Связаться с поддержкой", "help")])
 KB_RENEW = markup([btn("💳 Продлить подписку", "buy")])
 KB_PAY = lambda: markup([btn(f"💳 Оплатить {PRICE:.0f} ₽", "pay")], [btn("💬 Связаться", "help")])
 KB_PRODUCT = lambda: markup(
@@ -497,6 +617,8 @@ async def extend(uid: int, days: float, method_id: str | None = None,
         if exp > base:
             base, was_active = exp, True
     new_exp = base + timedelta(days=days)
+    sub_text = f"💳 Подписка {'продлена' if was_active else 'оформлена'}, активна до {fmt(new_exp)}."
+    await crm_notify(uid, sub_text)
     db.execute("""INSERT INTO users(user_id, expires_at, active, method_id, method_mode) VALUES(?,?,1,?,?)
                   ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at, active=1,
                   method_id=CASE WHEN ? THEN excluded.method_id
@@ -509,6 +631,10 @@ async def extend(uid: int, days: float, method_id: str | None = None,
                (uid, iso(new_exp), method_id, method_mode if method_id else None,
                 int(replace_method), int(replace_method), int(replace_method)))
     db.commit()
+    try:  # отметка в CRM: после сохранения подписки и без права сломать выдачу доступа
+        crm_sys(uid, sub_text)
+    except Exception:
+        logging.exception("не удалось записать оплату в CRM")
     status = autopay_status(
         db.execute("SELECT autopay, method_id, method_mode FROM users WHERE user_id=?", (uid,)).fetchone()
     )
@@ -591,41 +717,109 @@ async def set_subscription_days(uid: int, days: float):
 
 
 # ---------- Воронка: /start -> оплата ----------
+def has_consent(uid: int) -> bool:
+    row = db.execute("SELECT consent_at FROM users WHERE user_id=?", (uid,)).fetchone()
+    return bool(row and row["consent_at"])
+
+
+async def send_consent(uid: int, username: str | None, payload: str = ""):
+    """Первый экран: картинка + согласие на обработку данных и рассылку. Дальше только по кнопке «Соглашаюсь»."""
+    ensure_user(uid, username)
+    db.execute("UPDATE users SET start_payload=? WHERE user_id=?", (payload or "", uid))
+    db.commit()
+    text = T_CONSENT.format(consent=CONSENT_URL, privacy=PRIVACY_URL, ads=ADS_URL)
+    kb = markup([btn(T_CONSENT_BTN, "agree")], [btn(T_CONSENT_BTN_NOADS, "agree_noads")])
+    if os.path.isfile(WELCOME_IMAGE_PATH):
+        await bot.send_photo(uid, FSInputFile(WELCOME_IMAGE_PATH), caption=text, reply_markup=kb)
+    else:
+        logging.error("Картинка приветствия не найдена: %s", WELCOME_IMAGE_PATH)
+        await safe_send(ADMIN_ID, f"⚠️ Не найден файл картинки приветствия: <code>{html.escape(WELCOME_IMAGE_PATH)}</code>")
+        await bot.send_message(uid, text, reply_markup=kb)
+
+
+async def continue_start(user, payload: str):
+    """То, что раньше происходило сразу на /start. Вызывается после согласия (или если согласие уже есть)."""
+    uid = user.id
+    if payload == "__buy__":  # человек нажал «Оплатить» до согласия
+        await show_product(uid, user.username)
+        return
+    if funnel_source_id(payload) and not active_subscription(uid):
+        await funnel_start(user, payload)  # пришёл по ссылке из Instagram, YouTube и т.п. -> воронка
+        return
+    ensure_user(uid, user.username)
+    u = db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    if active_subscription(uid):
+        await bot.send_message(uid, T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))), reply_markup=KB_HELP)
+        return
+    if maintenance_enabled() and uid != ADMIN_ID:
+        await bot.send_message(uid, maintenance_message(), reply_markup=maintenance_keyboard())
+        return
+    await bot.send_message(uid, T_MENU, reply_markup=KB_MENU)
+
+
 @dp.message(Command("start", "join"))
-async def start(m: Message):
-    ensure_user(m.from_user.id, m.from_user.username)
-    u = db.execute("SELECT * FROM users WHERE user_id=?", (m.from_user.id,)).fetchone()
-    if active_subscription(m.from_user.id):
-        await m.answer(T_ACTIVE.format(date=fmt(datetime.fromisoformat(u["expires_at"]))), reply_markup=KB_HELP)
+async def start(m: Message, command: CommandObject):
+    payload = (command.args or "").strip()
+    uid = m.from_user.id
+    if not active_subscription(uid) and not has_consent(uid):
+        await send_consent(uid, m.from_user.username, payload)  # сначала согласие, воронка и оплата только после него
         return
-    if maintenance_enabled() and m.from_user.id != ADMIN_ID:
-        await m.answer(maintenance_message(), reply_markup=maintenance_keyboard())
-        return
-    await m.answer(T_WELCOME, reply_markup=KB_START)
+    await continue_start(m.from_user, payload)
+
+
+@dp.callback_query(F.data.in_({"agree", "agree_noads"}))
+async def agree(cb: CallbackQuery):
+    noads = cb.data == "agree_noads"
+    uid = cb.from_user.id
+    ensure_user(uid, cb.from_user.username)
+    row = db.execute("SELECT consent_at, start_payload FROM users WHERE user_id=?", (uid,)).fetchone()
+    payload = (row["start_payload"] or "") if row else ""
+    first_time = not (row and row["consent_at"])
+    if first_time:
+        db.execute("UPDATE users SET consent_at=?, ads_optout=? WHERE user_id=?", (iso(now()), int(noads), uid))
+        db.commit()
+        try:
+            crm_sys(uid, "✅ Согласился на обработку персональных данных, от рекламной рассылки отказался" if noads
+                    else "✅ Согласился на обработку персональных данных и рассылку")
+        except Exception:
+            logging.exception("не удалось записать согласие в CRM")
+    await cb.answer()
+    try:  # убираем кнопку, чтобы не нажимали дважды
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if first_time:
+        await continue_start(cb.from_user, payload)
 
 
 @dp.callback_query(F.data == "buy")
 async def buy(cb: CallbackQuery):
     uid = cb.from_user.id
     ensure_user(uid, cb.from_user.username)
-    if maintenance_enabled() and uid != ADMIN_ID:
-        await cb.message.answer(maintenance_message(), reply_markup=maintenance_keyboard())
+    if not active_subscription(uid) and not has_consent(uid):
+        await send_consent(uid, cb.from_user.username, "__buy__")  # без согласия к оплате не пускаем
         await cb.answer()
         return
+    await show_product(uid, cb.from_user.username)
+    await cb.answer()
+
+
+async def show_product(uid: int, username: str | None):
+    if username is not None:  # из CRM ник не передаём, чтобы не затереть его в базе
+        ensure_user(uid, username)
+    if maintenance_enabled() and uid != ADMIN_ID:
+        return await bot.send_message(uid, maintenance_message(), reply_markup=maintenance_keyboard())
     # человек дошёл до оплаты: запускаем таймер «застрял на оплате»
     db.execute("UPDATE users SET pay_started_at=?, stuck_reminded=0 WHERE user_id=? AND active=0", (iso(now()), uid))
     db.commit()
     offer = T_OFFER_LINK.format(url=html.escape(OFFER_URL, quote=True)) if OFFER_URL else T_OFFER_SOON
     text = T_PRODUCT.format(price=f"{PRICE:.0f}", offer=offer) + (T_AUTO_NOTE if AUTOCHARGE else "")
     if os.path.isfile(PAYMENT_IMAGE_PATH):
-        await cb.message.answer_photo(
-            FSInputFile(PAYMENT_IMAGE_PATH), caption=text, reply_markup=KB_PRODUCT()
-        )
+        return await bot.send_photo(uid, FSInputFile(PAYMENT_IMAGE_PATH), caption=text, reply_markup=KB_PRODUCT())
     else:
         logging.error("Изображение оплаты не найдено: %s", PAYMENT_IMAGE_PATH)
         await safe_send(ADMIN_ID, f"⚠️ Не найден файл картинки оплаты: <code>{html.escape(PAYMENT_IMAGE_PATH)}</code>")
-        await cb.message.answer(text, reply_markup=KB_PRODUCT())
-    await cb.answer()
+        return await bot.send_message(uid, text, reply_markup=KB_PRODUCT())
 
 
 @dp.callback_query(F.data == "payment:details")
@@ -680,6 +874,1407 @@ async def help_btn(cb: CallbackQuery):
     awaiting_help.add(cb.from_user.id)
     await cb.message.answer(T_HELP_PROMPT)
     await cb.answer()
+
+
+# ====================== FUNNEL: Instagram -> группа -> урок -> видео -> тест -> профиль админу ======================
+# Тексты воронки. Разметка HTML (<b>, <i>, <a href="...">) работает в сообщениях бота.
+FUNNEL_GREETING = ("Привет! Я бот Круга Ильи Хабирова. "
+                   "Чтобы подобрать для вас подходящий материал, ответьте на один вопрос.")
+FUNNEL_GROUP_Q = "<b>Кто вы и что ищете?</b>"
+# (текст кнопки, описание для админа)
+FUNNEL_GROUPS = [
+    ("🧭 Ищу себя и своё предназначение",
+     "Ищет себя и своё предназначение, хочет развить глубину понимания своей личности"),
+    ("💪 Стать сильнее и реализовать потенциал",
+     "Хочет стать сильнее, целостнее и реализовать свой потенциал на 100%"),
+    ("🔬 Я психолог / исследую человека",
+     "Психолог или исследователь человека и его глубины"),
+]
+
+# Единственный урок, который получают все. Замените на свой.
+FUNNEL_LESSON = "🎁 <b>Ваш первый урок</b>\nНазвание урока: https://example.com/lesson"
+
+# Видео «Что такое Круг»: ссылка (YouTube и т.п.) ИЛИ file_id видео из Telegram.
+# Как получить file_id: отправьте видео этому боту от своего аккаунта, он ответит file_id.
+FUNNEL_VIDEO = os.getenv("FUNNEL_VIDEO", "")
+# CRM-группа: закрытая группа с включёнными топиками (id вида -100...). Бот создаёт в ней тему на каждого лида.
+# 0 = не используется, профили и переписка приходят админу в личку.
+CRM_CHAT_ID = int(os.getenv("CRM_CHAT_ID", "0") or 0)
+FUNNEL_TOPIC_COLORS = {"cold": 7322096, "interested": 16766590, "ready": 9367192}  # синий, жёлтый, зелёный
+FUNNEL_VIDEO_TEXT = ("Посмотрите короткое видео о том, что такое Круг.\n\n"
+                     "А я подготовлю для вас уникальный подарок: лекцию из закрытого сообщества "
+                     "под вашу уникальную цель.")
+FUNNEL_TEST_INTRO = ("Отлично! Теперь пройдите, пожалуйста, наш короткий тест (7 вопросов), "
+                     "чтобы я мог подобрать для вас подходящую лекцию.")
+FUNNEL_THANKS = ("Спасибо за ваши ответы! 🙏\n"
+                 "Наш администратор лично подберёт для вас урок и пришлёт его сюда, в бот. Ожидайте.")
+
+# Рекомендации по сегментам (редактируйте под свои продукты)
+FUNNEL_SEGMENTS = {
+    "cold": ("❄️ Холодный", "знакомство с бесплатным контентом и бесплатным уроком",
+             "бесплатный канал @habirov_cyrcle и бесплатный урок"),
+    "interested": ("🙂 Заинтересованный", "подходящий курс или образовательная программа",
+                   "подписка «Круг» (закрытый канал с лекциями)"),
+    "ready": ("🔥 Готовый", "наиболее подходящий платный продукт",
+              "подписка «Круг»: предложить оплату в первую очередь"),
+}
+# Рекомендуемое направление по ответу на 1-й вопрос теста (по порядку вариантов)
+FUNNEL_DIRECTIONS = [
+    "реализация потенциала, деньги и действия",
+    "уверенность в себе и самопроявление",
+    "дисциплина, привычки и внутренняя опора",
+    "отношения с людьми и повторяющиеся сценарии",
+    "эмоциональная устойчивость и ресурс",
+    "поиск предназначения и самоопределение",
+    "глубинное самопознание и внутреннее развитие",
+    "определить по свободному ответу",
+]
+
+# Тест. type: single (одна кнопка) | multi (несколько + «Готово») | text (только текстом).
+# free=True: можно ответить и своим сообщением вместо кнопки.
+FUNNEL_TEST = [
+    {"key": "q1", "type": "single", "free": True,
+     "title": "Главный запрос",
+     "text": "Если бы ты мог прямо сейчас изменить одну сферу своей жизни, чтобы почувствовать, "
+             "что действительно движешься вперёд, что бы ты выбрал?",
+     "options": ["Финансы и реализация", "Уверенность в себе", "Дисциплина и сила воли",
+                 "Отношения с людьми", "Эмоциональное состояние", "Поиск своего предназначения",
+                 "Самопознание и внутреннее развитие", "Другое"]},
+    {"key": "q2", "type": "single", "free": True,
+     "title": "Основная проблема",
+     "text": "А что сейчас больше всего мешает тебе получить желаемое?",
+     "options": ["Не хватает дисциплины и последовательности", "Не понимаю, чего действительно хочу",
+                 "Знаю, что нужно делать, но постоянно откладываю",
+                 "Боюсь проявляться и заявлять о себе",
+                 "Чувствую, что мой потенциал намного больше, чем мои результаты",
+                 "Не могу избавиться от повторяющихся сценариев",
+                 "Не хватает энергии и внутренней опоры", "Другое"]},
+    {"key": "q3", "type": "single", "free": False,
+     "title": "Продолжительность проблемы",
+     "text": "Как давно ты замечаешь за собой эту ситуацию?",
+     "options": ["Несколько недель", "Несколько месяцев", "Несколько лет",
+                 "Кажется, это повторяется всю мою жизнь"]},
+    {"key": "q4", "type": "multi", "free": False,
+     "title": "Предыдущий опыт",
+     "text": "Пробовал ли ты раньше что-нибудь делать, чтобы изменить эту ситуацию?\n"
+             "(Можно выбрать несколько, затем нажмите «Готово».)",
+     "options": ["Читал книги по психологии и саморазвитию", "Проходил курсы и тренинги",
+                 "Работал с психологом или наставником",
+                 "Пробовал самостоятельно внедрять привычки и практики",
+                 "Много изучал, но мало применял", "Практически ничего не пробовал"]},
+    {"key": "q5", "type": "text", "free": True,
+     "title": "Желаемый результат",
+     "text": "Представь, что через 3 месяца ты действительно проделал большую внутреннюю работу. "
+             "Что должно измениться в твоей жизни, чтобы ты сказал: «Это было одно из лучших "
+             "решений, которые я принял»?\n\nНапишите ответ сообщением 👇",
+     "options": []},
+    {"key": "q6", "type": "single", "free": False,
+     "title": "Мотивация",
+     "text": "Насколько для тебя сейчас важно изменить эту ситуацию?",
+     "options": ["Просто интересуюсь саморазвитием", "Было бы здорово что-то изменить",
+                 "Давно хочу изменений, но никак не могу начать",
+                 "Я действительно готов заниматься собой и действовать"]},
+    {"key": "q7", "type": "single", "free": False,
+     "title": "Предпочтительный формат",
+     "text": "Какой формат развития тебе ближе?",
+     "options": ["Самостоятельное обучение через приложение и практические задания",
+                 "Структурированная программа с уроками и упражнениями", "Сообщество единомышленников",
+                 "Работа с наставником и обратная связь",
+                 "Комплексный подход: обучение, практика и окружение"]},
+]
+OTHER = "Другое"
+NO_EXPERIENCE = "Практически ничего не пробовал"
+LOTS_OF_STUDY = "Много изучал, но мало применял"
+
+
+def funnel_source_id(payload) -> str | None:
+    """Какому источнику (insta, yt...) соответствует параметр ссылки. None = это не ссылка воронки."""
+    p = str(payload or "").strip()
+    for key in FUNNEL_SOURCES:
+        if p.startswith(key):
+            return key
+    return None
+
+
+def funnel_source_detail(payload) -> str | None:
+    """Уточнение после названия источника: yt_shadow -> shadow."""
+    p, key = str(payload or "").strip(), funnel_source_id(payload)
+    d = p[len(key):].lstrip("_-") if key else ""
+    return d or None
+
+
+def funnel_source_label(payload) -> str:
+    """Подпись источника для CRM: «▶️ YouTube (shadow)»."""
+    key = funnel_source_id(payload)
+    if not key:
+        return str(payload or "—")
+    icon, name = FUNNEL_SOURCES[key]
+    d = funnel_source_detail(payload)
+    return f"{icon} {name}" + (f" ({d})" if d else "")
+
+
+def funnel_trunc(s, n: int = 300) -> str:
+    s = str(s or "").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def funnel_segment(a: dict) -> str:
+    """Сегмент отражает коммерческую готовность, а не оценку личности."""
+    if a.get("flow") == "v2":  # новая воронка: дошёл до конца = готов к работе
+        return "ready"
+    q6 = a.get("q6_i")
+    q5 = (a.get("q5") or "").strip()
+    q4 = a.get("q4") or []
+    no_exp = q4 == [NO_EXPERIENCE]
+    if q6 == 3 and len(q5) >= 20:
+        return "ready"
+    if q6 == 0 or (q6 == 1 and no_exp and len(q5) < 20):
+        return "cold"
+    return "interested"
+
+
+def funnel_extra_problems(a: dict) -> str:
+    out = []
+    if LOTS_OF_STUDY in (a.get("q4") or []):
+        out.append("знания не превращаются в действия")
+    if a.get("q3_i") == 3:
+        out.append("устойчивый повторяющийся сценарий «на всю жизнь»")
+    if a.get("q2_i") in (1, 4) and a.get("q1_i") != 5:
+        out.append("неясность собственных желаний и предназначения" if a.get("q2_i") == 1
+                   else "разрыв между потенциалом и результатами")
+    return "; ".join(out) or "не выявлены"
+
+
+def funnel_resume(a: dict, seg: str) -> str:
+    """Короткое индивидуальное резюме по шаблонам: фразы меняются в зависимости от ответов."""
+    low = lambda s: str(s or "").strip().rstrip(".").lower()
+    parts = [f"Главный запрос сейчас: «{low(a.get('q1'))}». Основное, что мешает: «{low(a.get('q2'))}»."]
+    if a.get("q3"):
+        parts.append(f"Как давно это длится: {low(a['q3'])}.")
+    q4 = a.get("q4") or []
+    if NO_EXPERIENCE in q4:
+        parts.append("Опыта работы над собой почти нет, это первый шаг.")
+    elif LOTS_OF_STUDY in q4:
+        parts.append("Много изучал, но знания слабо превращаются в действия: нужна практика и структура.")
+    elif q4:
+        parts.append("Уже пробовал: " + ", ".join(low(x) for x in q4) + ".")
+    if (a.get("q5") or "").strip():
+        parts.append(f"Через 3 месяца хочет прийти к такому результату: «{funnel_trunc(a['q5'], 200)}».")
+    motiv = ["пока просто интересуется саморазвитием", "считает, что было бы здорово что-то изменить",
+             "давно хочет перемен, но не может начать", "готов заниматься собой и действовать"]
+    if a.get("q6_i") is not None and 0 <= a["q6_i"] < 4:
+        parts.append(f"Мотивация: {motiv[a['q6_i']]}.")
+    if a.get("q7"):
+        parts.append(f"Ближе формат: {low(a['q7'])}.")
+    return " ".join(parts)
+
+
+def funnel_card_v2(uid: int, full_name: str, username, row, a: dict) -> str:
+    e = html.escape
+    who = f'<a href="tg://user?id={uid}">{e(full_name)}</a>' + (f" @{e(username)}" if username else "")
+    lines = ["🟢 <b>Новая заявка: прошёл воронку, готов к работе</b>",
+             f"Пользователь: {who}, id <code>{uid}</code>",
+             f"Источник: {e(funnel_source_label(row['source']))}",
+             f"Бесплатный урок: {e(a.get('lesson') or '—')}", "", "<b>Ответы на вопросы</b>"]
+    for i, t in enumerate(FX_Q_SHORT):
+        lines += [f"<b>{i + 1}. {e(t)}</b>", e(funnel_trunc(a.get(f"q{i + 1}"), 450) or "—"), ""]
+    lines += ["<b>Опыт в приложении</b>",
+              "Получил ценность: " + ("да" if a.get("fb_value") == "yes" else "—"),
+              f"Что понравилось: {e(funnel_trunc(a.get('fb_text'), 450) or '—')}", "",
+              "<i>Полные ответы в карточке лида в CRM-мини-аппе.</i>"]
+    return "\n".join(lines)
+
+
+def funnel_card(uid: int, full_name: str, username, row, a: dict) -> str:
+    if a.get("flow") == "v2":
+        return funnel_card_v2(uid, full_name, username, row, a)
+    e = html.escape
+    seg = funnel_segment(a)
+    label, seg_hint, product = FUNNEL_SEGMENTS[seg]
+    q1_i = a.get("q1_i")
+    direction = FUNNEL_DIRECTIONS[q1_i] if isinstance(q1_i, int) and 0 <= q1_i < len(FUNNEL_DIRECTIONS) \
+        else FUNNEL_DIRECTIONS[-1]
+    who = f'<a href="tg://user?id={uid}">{e(full_name)}</a>' + (f" @{e(username)}" if username else "")
+    q4 = a.get("q4") or []
+    lines = [
+        "🆕 <b>Новая заявка из воронки</b>",
+        f"Пользователь: {who}, id <code>{uid}</code>",
+        f"Источник: {e(funnel_source_label(row['source']))}",
+        f"Аудитория: {e(a.get('group') or '—')}",
+        f"Сегмент: <b>{label}</b> (рекомендация: {seg_hint})",
+        "",
+        "<b>Профиль</b>",
+        f"• Главный запрос: {e(funnel_trunc(a.get('q1')))}",
+        f"• Основная проблема: {e(funnel_trunc(a.get('q2')))}",
+        f"• Дополнительные проблемы: {e(funnel_extra_problems(a))}",
+        f"• Как давно: {e(a.get('q3') or '—')}",
+        f"• Предыдущий опыт: {e('; '.join(q4) or '—')}",
+        f"• Желаемый результат: {e(funnel_trunc(a.get('q5')) or '—')}",
+        f"• Мотивация: {e(a.get('q6') or '—')}",
+        f"• Формат: {e(a.get('q7') or '—')}",
+        f"• Рекомендуемое направление: {e(direction)}",
+        f"• Рекомендуемый продукт: {e(product)}",
+        "",
+        "<b>Резюме</b>",
+        e(funnel_resume(a, seg)),
+        "",
+        "<i>Сегмент отражает коммерческую готовность, а не оценку личности.</i>",
+    ]
+    return "\n".join(lines)
+
+
+# ---------- база ----------
+def funnel_get(uid: int):
+    return db.execute("SELECT * FROM funnel_users WHERE user_id=?", (uid,)).fetchone()
+
+
+def funnel_answers(row) -> dict:
+    return json.loads(row["answers"] or "{}")
+
+
+def funnel_update(uid: int, **fields):
+    keys = ", ".join(f"{k}=?" for k in fields)
+    db.execute(f"UPDATE funnel_users SET {keys} WHERE user_id=?", (*fields.values(), uid))
+    db.commit()
+
+
+def funnel_reset(uid: int, source: str):
+    db.execute("""INSERT INTO funnel_users(user_id, source, answers, stage, step, tmp, done, created)
+                  VALUES(?,?,'{"flow":"v2"}','pick',0,'[]',0,?)
+                  ON CONFLICT(user_id) DO UPDATE SET source=excluded.source, answers='{"flow":"v2"}',
+                    stage='pick', step=0, tmp='[]', done=0, done_at=0, series_idx=0, next_at=0""",
+               (uid, source, int(time.time())))
+    db.commit()
+
+
+def funnel_set_answer(uid: int, key: str, value, idx=None):
+    a = funnel_answers(funnel_get(uid))
+    a[key] = value
+    a[key + "_i"] = idx
+    funnel_update(uid, answers=json.dumps(a, ensure_ascii=False))
+
+
+# ---------- шаги ----------
+def funnel_test_text(qi: int) -> str:
+    q = FUNNEL_TEST[qi]
+    text = f"<b>Вопрос {qi + 1} из {len(FUNNEL_TEST)}</b>\n{html.escape(q['text'])}"
+    if q["options"]:
+        text += "\n\n" + "\n".join(f"{i + 1}. {html.escape(o)}" for i, o in enumerate(q["options"]))
+    if q["free"] and q["type"] != "text":
+        text += "\n\n<i>Можно выбрать номер кнопкой или написать свой ответ сообщением.</i>"
+    return text
+
+
+def funnel_test_markup(qi: int, selected=()):
+    q = FUNNEL_TEST[qi]
+    if not q["options"]:
+        return None
+    buttons = []
+    for oi in range(len(q["options"])):
+        mark = "✅" if (q["type"] == "multi" and oi in selected) else ""
+        buttons.append(InlineKeyboardButton(text=f"{mark}{oi + 1}", callback_data=f"ft:{qi}:{oi}"))
+    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+    if q["type"] == "multi":
+        rows.append([btn("Готово ➡️", f"ftd:{qi}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def funnel_ask(uid: int, qi: int):
+    await bot.send_message(uid, funnel_test_text(qi), reply_markup=funnel_test_markup(qi))
+
+
+async def funnel_next(uid: int):
+    step = funnel_get(uid)["step"] + 1
+    if step < len(FUNNEL_TEST):
+        funnel_update(uid, step=step, tmp="[]")
+        await funnel_ask(uid, step)
+    else:
+        await funnel_finish(uid)
+
+
+FUNNEL_STAGE_NAMES = {"group": "выбор аудитории", "video": "видео «Что такое Круг»", "test": "тест",
+                      "pick": "выбор урока", "wait1": "ждёт предложения вопросов", "offer": "предложение ответить на вопросы",
+                      "qa": "5 вопросов", "wait2": "ждёт вопроса про опыт", "fb": "вопрос про опыт",
+                      "fbreason": "причина «нет»", "fbtext": "что понравилось", "closed": "закрыт (отказался)",
+                      "done": "заявка готова"}
+FUNNEL_HINTED: set = set()  # кому уже показали подсказку на текущем шаге (чтобы не повторять)
+
+
+def funnel_partial_card(uid: int, full_name: str, username, row, a: dict) -> str:
+    e = html.escape
+    who = f'<a href="tg://user?id={uid}">{e(full_name)}</a>' + (f" @{e(username)}" if username else "")
+    stage = FUNNEL_STAGE_NAMES.get(row["stage"], row["stage"])
+    if row["stage"] == "test":
+        stage += f", вопрос {row['step'] + 1} из {len(FUNNEL_TEST)}"
+    if a.get("flow") == "v2":
+        if row["stage"] == "qa":
+            stage += f", вопрос {row['step'] + 1} из {len(FX_QUESTIONS)}"
+        return "\n".join([
+            "💬 <b>Лид из воронки (в процессе)</b>",
+            f"Пользователь: {who}, id <code>{uid}</code>",
+            f"Источник: {e(funnel_source_label(row['source']))}",
+            f"Урок: {e(a.get('lesson') or 'ещё не выбрал')}",
+            f"Этап: {e(stage)}",
+        ])
+    return "\n".join([
+        "💬 <b>Лид из воронки: тест не завершён</b>",
+        f"Пользователь: {who}, id <code>{uid}</code>",
+        f"Источник: {e(funnel_source_label(row['source']))}",
+        f"Аудитория: {e(a.get('group') or 'ещё не выбрал')}",
+        f"Остановился на этапе: {e(stage)}",
+    ])
+
+
+async def funnel_build_card(uid: int):
+    """Карточка лида: полный профиль после теста, краткая, если тест не завершён."""
+    row = funnel_get(uid)
+    u = db.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
+    try:
+        chat = await bot.get_chat(uid)
+        full_name = chat.full_name or str(uid)
+    except Exception:
+        full_name = str(uid)
+    a = funnel_answers(row)
+    username = u["username"] if u else None
+    if row["done"]:
+        return funnel_card(uid, full_name, username, row, a), full_name, funnel_segment(a)
+    return funnel_partial_card(uid, full_name, username, row, a), full_name, None
+
+
+# ---------- Мини-апп CRM: настройки и переключатель топиков ----------
+# Стадии воронки. Определяются сами; в карточке лида стадию можно поставить вручную («Авто» возвращает автоматику).
+CRM_STAGES = {"entered": "Зашёл в бота", "series": "Серия уроков", "ready": "Готов к закрытию",
+              "won": "Купил подписку", "lost": "Не купил / закрыт"}
+# Вероятность оплаты по стадиям для оценки «потенциальной прибыли». Правьте под свою реальную конверсию.
+CRM_PROB_STAGE = {"entered": 0.05, "series": 0.2, "ready": 0.5}
+
+# ---------- СЕРИЯ УРОКОВ ----------
+# Письма, которые бот сам присылает после того, как человек прошёл квалификацию (тест).
+# Формат: (через сколько дней после теста, текст). 0 = сразу. Разметка: <b>жирный</b>, <i>курсив</i>.
+# Пока список пустой: стадия «Серия уроков» заканчивается сразу после теста и человек
+# попадает в «Готов к закрытию». Добавьте письма, например:
+#   (1, "📩 <b>Урок 2.</b> Текст письма..."),
+#   (3, "📩 <b>Урок 3.</b> Текст письма..."),
+FUNNEL_SERIES: list[tuple[float, str]] = []
+
+
+def crm_topics_on() -> bool:
+    """CRM в топиках включена: задана CRM-группа и она не выключена кнопкой (команда /crm_topics или мини-апп)."""
+    if not CRM_CHAT_ID:
+        return False
+    r = db.execute("SELECT v FROM meta WHERE k='crm_topics'").fetchone()
+    return not (r and r["v"] == "0")
+
+
+def crm_topics_set(on: bool):
+    db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('crm_topics',?)", ("1" if on else "0",))
+    db.commit()
+
+
+def crm_open_kb(uid: int | None = None):
+    """Кнопка «Открыть в CRM» (мини-апп). None, если мини-апп выключен."""
+    if not (MINIAPP_ENABLED and MINIAPP_URL):
+        return None
+    url = MINIAPP_URL + "/app" + (f"?lead={uid}" if uid else "")
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📱 Открыть в CRM", web_app=WebAppInfo(url=url))]])
+
+
+def crm_remember_name(u):
+    db.execute("INSERT INTO crm_profiles(user_id, name) VALUES(?,?) "
+               "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name", (u.id, u.full_name or ""))
+
+
+def crm_untrash(uid: int):
+    """Человек из корзины снова написал или нажал кнопку: возвращаем его в работу (коммитит вызывающий)."""
+    r = db.execute("SELECT stage FROM crm_leads WHERE user_id=?", (uid,)).fetchone()
+    if r and r["stage"] == "lost":
+        db.execute("UPDATE crm_leads SET stage='auto', trashed_at=0 WHERE user_id=?", (uid,))
+        db.execute("INSERT INTO crm_messages(user_id, direction, text, ts) VALUES(?,?,?,?)",
+                   (uid, "sys", "↩️ Вернулся: снова написал или нажал кнопку, стадия «закрыт» снята", int(time.time())))
+
+
+def crm_sys(uid: int, text: str):
+    """Служебная серая строка в чате мини-аппа: что человек нажал в боте, какой этап прошёл."""
+    if uid == ADMIN_ID:
+        return
+    crm_untrash(uid)
+    db.execute("INSERT INTO crm_messages(user_id, direction, text, ts) VALUES(?,?,?,?)",
+               (uid, "sys", text, int(time.time())))
+    db.commit()
+
+
+def crm_log(uid: int, direction: str, m: Message, tg_id: int = 0):
+    """Сохраняет переписку в базу (видна в мини-аппе). tg_id нужен, чтобы потом удалить сообщение у человека."""
+    text = m.text or m.caption or f"[{m.content_type}]"
+    db.execute("INSERT INTO crm_messages(user_id, direction, text, ts, tg_id) VALUES(?,?,?,?,?)",
+               (uid, direction, text, int(time.time()), tg_id or (m.message_id if direction == "in" else 0)))
+    if direction == "in":
+        crm_untrash(uid)
+    if direction == "in" and m.from_user:
+        crm_remember_name(m.from_user)
+    db.commit()
+
+
+def crm_topic_title(name: str, seg) -> str:
+    return f"{name} · {FUNNEL_SEGMENTS[seg][0] if seg else 'новый'}"[:128]
+
+
+async def crm_post_card(uid: int, thread: int):
+    """Кладёт карточку лида в его тему и закрепляет."""
+    card, _, _ = await funnel_build_card(uid)
+    sent = await bot.send_message(
+        CRM_CHAT_ID, card + "\n\n<i>Отвечайте прямо в этой теме: сообщение уйдёт пользователю.</i>",
+        message_thread_id=thread)
+    try:
+        await bot.pin_chat_message(CRM_CHAT_ID, sent.message_id, disable_notification=True)
+    except Exception:
+        logging.warning("не удалось закрепить карточку лида")
+
+
+async def crm_topic(uid: int):
+    """Тема лида в CRM-группе: возвращает id темы, создаёт при необходимости. None, если CRM не настроена."""
+    if not crm_topics_on():
+        return None
+    r = db.execute("SELECT thread_id FROM crm_topics WHERE user_id=?", (uid,)).fetchone()
+    if r:
+        return r["thread_id"]
+    try:
+        _, name, seg = await funnel_build_card(uid)
+        kwargs = {"icon_color": FUNNEL_TOPIC_COLORS[seg]} if seg else {}
+        topic = await bot.create_forum_topic(CRM_CHAT_ID, crm_topic_title(name, seg), **kwargs)
+        thread = topic.message_thread_id
+        db.execute("INSERT OR REPLACE INTO crm_topics(user_id, chat_id, thread_id) VALUES(?,?,?)",
+                   (uid, CRM_CHAT_ID, thread))
+        db.commit()
+        await crm_post_card(uid, thread)
+        return thread
+    except Exception:
+        logging.exception("не удалось создать тему в CRM-группе (бот админ с правом «Управление темами»?)")
+        return None
+
+
+async def funnel_card_to_admin(uid: int):
+    card, _, _ = await funnel_build_card(uid)
+    kb = markup([btn("✉️ Написать ему", f"users:message:{uid}:0")],
+                [btn("👤 Карточка пользователя", f"users:view:{uid}:0")])
+    try:
+        await bot.send_message(ADMIN_ID, card, reply_markup=kb)
+    except Exception:
+        logging.exception("не удалось отправить профиль админу")
+
+
+async def funnel_finish(uid: int):
+    funnel_update(uid, stage="done", done=1, tmp="[]", done_at=int(time.time()), series_idx=0)
+    try:
+        crm_sys(uid, "✅ Прошёл квалификацию (тест): " + FUNNEL_SEGMENTS[funnel_segment(funnel_answers(funnel_get(uid)))][0])
+    except Exception:
+        crm_sys(uid, "✅ Прошёл квалификацию (тест)")
+    await bot.send_message(uid, FUNNEL_THANKS)
+    existed = crm_topics_on() and db.execute(
+        "SELECT 1 FROM crm_topics WHERE user_id=?", (uid,)).fetchone() is not None
+    thread = await crm_topic(uid)
+    if thread is None:  # CRM-группа не настроена или тема не создалась: профиль в личку админу
+        await funnel_card_to_admin(uid)
+    elif existed:  # тема уже была (человек писал до конца теста): полный профиль и новое название
+        try:
+            await crm_post_card(uid, thread)
+            _, name, seg = await funnel_build_card(uid)
+            await bot.edit_forum_topic(CRM_CHAT_ID, thread, name=crm_topic_title(name, seg))
+        except Exception:
+            logging.exception("не удалось обновить тему лида")
+
+
+async def funnel_send_video(uid: int):
+    kb = markup([btn("✅ Я посмотрел", "fv:ok")])
+    v = FUNNEL_VIDEO.strip()
+    text = FUNNEL_VIDEO_TEXT
+    if v and not v.startswith("http"):  # file_id видео
+        try:
+            await bot.send_video(uid, v, caption=text, reply_markup=kb)
+            return
+        except Exception:
+            logging.exception("не удалось отправить видео воронки")
+    text += f"\n\n{v}" if v.startswith("http") else "\n\n(видео будет добавлено позже)"
+    await bot.send_message(uid, text, reply_markup=kb)
+
+
+async def funnel_start(user, payload: str):
+    uid = user.id
+    ensure_user(uid, user.username)
+    row = funnel_get(uid)
+    if row and funnel_answers(row).get("flow") == "v2" and row["stage"] != "pick":
+        await fx_resend(uid, row)  # уже в воронке: повторяем текущий шаг, не начинаем заново
+        return
+    funnel_reset(uid, payload)
+    kb = markup(*[[btn(label, f"fx:l:{i}")] for i, (label, _) in enumerate(FX_LESSONS)])
+    await bot.send_message(uid, FX_PICK_Q, reply_markup=kb)
+
+
+async def funnel_clear_buttons(cb: CallbackQuery):
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+# ---------- обработчики ----------
+@dp.callback_query(F.data.startswith("fg:"))
+async def funnel_group(cb: CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    row = funnel_get(uid)
+    try:
+        i = int(cb.data.split(":")[1])
+        assert 0 <= i < len(FUNNEL_GROUPS)
+    except (ValueError, AssertionError):
+        return
+    if not row or row["stage"] != "group":
+        return
+    funnel_set_answer(uid, "group", FUNNEL_GROUPS[i][1], i)
+    funnel_update(uid, stage="video")
+    await funnel_clear_buttons(cb)
+    await bot.send_message(uid, FUNNEL_LESSON)
+    await funnel_send_video(uid)
+
+
+@dp.callback_query(F.data == "fv:ok")
+async def funnel_watched(cb: CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    row = funnel_get(uid)
+    if not row or row["stage"] != "video":
+        return
+    funnel_update(uid, stage="test", step=0, tmp="[]")
+    try:  # кнопку убираем, подпись у видео остаётся
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await bot.send_message(uid, FUNNEL_TEST_INTRO)
+    await funnel_ask(uid, 0)
+
+
+@dp.callback_query(F.data.startswith("ft:"))
+async def funnel_test_answer(cb: CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    row = funnel_get(uid)
+    try:
+        _, qi, oi = cb.data.split(":")
+        qi, oi = int(qi), int(oi)
+        q = FUNNEL_TEST[qi]
+        opt = q["options"][oi]
+    except (ValueError, IndexError):
+        return
+    if not row or row["stage"] != "test" or row["step"] != qi:  # защита от старых кнопок
+        return
+    if q["type"] == "multi":
+        selected = set(json.loads(row["tmp"] or "[]"))
+        selected ^= {oi}
+        funnel_update(uid, tmp=json.dumps(sorted(selected)))
+        try:
+            await cb.message.edit_reply_markup(reply_markup=funnel_test_markup(qi, selected))
+        except Exception:
+            pass
+        return
+    if opt == OTHER:
+        await bot.send_message(uid, "Напишите свой вариант одним сообщением 👇")
+        return
+    funnel_set_answer(uid, q["key"], opt, oi)
+    await funnel_clear_buttons(cb)
+    await funnel_next(uid)
+
+
+@dp.callback_query(F.data.startswith("ftd:"))
+async def funnel_test_multi_done(cb: CallbackQuery):
+    uid = cb.from_user.id
+    row = funnel_get(uid)
+    try:
+        qi = int(cb.data.split(":")[1])
+        q = FUNNEL_TEST[qi]
+    except (ValueError, IndexError):
+        await cb.answer()
+        return
+    if not row or row["stage"] != "test" or row["step"] != qi:
+        await cb.answer()
+        return
+    selected = sorted(json.loads(row["tmp"] or "[]"))
+    if not selected:
+        await cb.answer("Выберите хотя бы один вариант.", show_alert=True)
+        return
+    await cb.answer()
+    funnel_set_answer(uid, q["key"], [q["options"][i] for i in selected], selected)
+    await funnel_clear_buttons(cb)
+    await funnel_next(uid)
+
+
+@dp.message(Command("app"), F.from_user.id == ADMIN_ID, F.chat.type == "private")
+async def cmd_app(m: Message):
+    """Открыть CRM-мини-апп."""
+    kb = crm_open_kb()
+    if not kb:
+        await m.answer("Мини-апп выключен: задайте MINIAPP_URL (адрес из вкладки «Домен» в Bothost) и MINIAPP=1.")
+        return
+    await m.answer("📱 CRM-мини-апп:", reply_markup=kb)
+
+
+@dp.message(Command("crm_topics"), F.from_user.id == ADMIN_ID, F.chat.type == "private")
+async def cmd_crm_topics(m: Message, command: CommandObject):
+    """/crm_topics — переключить CRM в топиках; /crm_topics on|off — включить или выключить явно."""
+    if not CRM_CHAT_ID:
+        await m.answer("CRM-группа с топиками не настроена (нет CRM_CHAT_ID).")
+        return
+    arg = (command.args or "").strip().lower()
+    crm_topics_set(arg == "on" if arg in ("on", "off") else not crm_topics_on())
+    if crm_topics_on():
+        await m.answer("✅ CRM в топиках включена: новые лиды и сообщения идут в темы группы.")
+    else:
+        await m.answer("⛔ CRM в топиках выключена. Сообщения лидов приходят сюда уведомлением "
+                       "с кнопкой «Открыть в CRM», вся работа в мини-аппе. Вернуть: /crm_topics",
+                       reply_markup=crm_open_kb())
+
+
+@dp.message(Command("links"), F.from_user.id == ADMIN_ID, F.chat.type == "private")
+async def cmd_links(m: Message):
+    """Ссылки на воронку по источникам."""
+    me = await bot.get_me()
+    lines = ["🔗 <b>Ссылки на воронку</b> (источник лида отмечается в CRM):", ""]
+    for key, (icon, name) in FUNNEL_SOURCES.items():
+        lines.append(f"{icon} {name}: <code>https://t.me/{me.username}?start={key}</code>")
+    lines += ["", "Чтобы различать ролики или посты, добавьте метку: "
+              f"<code>?start={next(iter(FUNNEL_SOURCES))}_reels1</code>. В CRM будет видно источник и метку."]
+    await m.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+def crm_resolve_user(arg: str):
+    arg = arg.strip()
+    if arg.lstrip("-").isdigit():
+        return int(arg)
+    r = db.execute("SELECT user_id FROM users WHERE lower(username)=lower(?)", (arg.lstrip("@"),)).fetchone()
+    return r["user_id"] if r else None
+
+
+def crm_cmd_target(m: Message, command: CommandObject):
+    """Кого касается команда: id или @ник в аргументе; в теме лида в CRM-группе это сам лид; иначе вы сами."""
+    arg = (command.args or "").strip()
+    if arg:
+        return crm_resolve_user(arg)
+    if CRM_CHAT_ID and m.chat.id == CRM_CHAT_ID and m.message_thread_id:
+        r = db.execute("SELECT user_id FROM crm_topics WHERE chat_id=? AND thread_id=?",
+                       (m.chat.id, m.message_thread_id)).fetchone()
+        return r["user_id"] if r else None
+    return ADMIN_ID
+
+
+@dp.message(Command("reset"), F.from_user.id == ADMIN_ID)
+async def cmd_reset(m: Message, command: CommandObject):
+    """/reset: сбросить свою воронку и начать заново. /reset 123456 или /reset @ник: сбросить человека.
+    В теме лида в CRM-группе: просто /reset."""
+    uid = crm_cmd_target(m, command)
+    if uid is None:
+        await m.answer("Не нашёл такого человека. Укажите id или @ник, либо отправьте команду в его теме.")
+        return
+    await crm_do_reset(m, uid)
+
+
+async def crm_do_reset(m: Message, uid: int):
+    await crm_reset_lead(uid, start=(uid == ADMIN_ID))
+    if uid == ADMIN_ID:
+        await m.answer("🔄 Ваша воронка сброшена, начинаем с нулевого шага 👆")
+    else:
+        await m.answer(f"🔄 Воронка {html.escape(crm_display_name(uid))} сброшена на нулевой шаг. Ему ничего не "
+                       "отправлено: когда он снова откроет ссылку воронки, начнёт сначала.")
+
+
+@dp.message(Command("erase"), F.from_user.id == ADMIN_ID)
+async def cmd_erase(m: Message, command: CommandObject):
+    """/erase: удалить из базы себя. /erase 123456 или /erase @ник: удалить человека. В теме лида: просто /erase."""
+    uid = crm_cmd_target(m, command)
+    if uid is None:
+        await m.answer("Не нашёл такого человека. Укажите id или @ник, либо отправьте команду в его теме.")
+        return
+    await crm_ask_erase(m, uid)
+
+
+async def crm_ask_erase(m: Message, uid: int):
+    await m.answer(
+        f"Удалить из базы <b>{html.escape(crm_display_name(uid))}</b> (id <code>{uid}</code>)?\n"
+        "Пропадут переписка, заметки, воронка и запись о нём. Платежи останутся в истории. "
+        "Если он напишет снова, начнёт с нулевого шага.",
+        reply_markup=markup([btn("🗑 Да, удалить", f"er:y:{uid}"), btn("Отмена", "er:n:0")]))
+
+
+@dp.callback_query(F.data.startswith("er:"), F.from_user.id == ADMIN_ID)
+async def cb_erase(cb: CallbackQuery):
+    _, act, uid = cb.data.split(":")
+    if act != "y":
+        await cb.answer("Отменено")
+        await cb.message.delete()
+        return
+    err = await crm_erase_lead(int(uid))
+    await cb.answer("Удалено" if not err else "Не удалено", show_alert=bool(err))
+    if err:
+        await cb.message.answer("⚠️ " + err)
+    else:
+        try:
+            await cb.message.edit_text(f"🗑 Удалён из базы: id <code>{uid}</code>.")
+        except Exception:
+            pass
+
+
+@dp.message(Command("chatid"))
+async def crm_chat_id(m: Message):
+    """Админ отправляет /chatid в группе и получает id для переменной CRM_CHAT_ID."""
+    if m.from_user.id == ADMIN_ID:
+        await m.answer(f"id этого чата (вставьте в переменную CRM_CHAT_ID):\n<code>{m.chat.id}</code>")
+
+
+T_PAY_REQUEST = "Чтобы оформить подписку, нажмите на кнопку ниже 👇"
+
+
+async def crm_send_pay(m: Message, uid: int, custom: str):
+    """/pay в теме лида: пользователю уходит сообщение с кнопкой оплаты (карточка, оферта, оплата)."""
+    sub = active_subscription(uid)
+    if sub:
+        await m.reply(f"У пользователя уже активная подписка до {fmt(datetime.fromisoformat(sub['expires_at']))}. "
+                      "Форму оплаты не отправляю.")
+        return
+    try:
+        if custom:
+            await bot.send_message(uid, html.escape(custom))
+        sent = await show_product(uid, None)
+        crm_out_save(m.chat.id, m.message_id, uid, sent.message_id)
+    except Exception:
+        logging.exception("не удалось отправить форму оплаты пользователю %s", uid)
+        await m.reply("⚠️ Не удалось отправить: пользователь мог заблокировать бота.")
+        return
+    db.execute("INSERT INTO crm_messages(user_id, direction, text, ts) VALUES(?,?,?,?)",
+               (uid, "out", "[форма оплаты]" + (f" {custom}" if custom else ""), int(time.time())))
+    db.commit()
+    db.execute("UPDATE users SET pay_started_at=? WHERE user_id=? AND active=0", (iso(now()), uid))
+    db.commit()
+    await m.reply("✅ Форма оплаты отправлена.")
+
+
+def crm_out_save(chat_id: int, message_id: int, uid: int, user_message_id: int):
+    """Запоминает, какому сообщению пользователя соответствует сообщение админа в теме."""
+    db.execute("INSERT OR REPLACE INTO crm_out(chat_id, message_id, user_id, user_message_id) VALUES(?,?,?,?)",
+               (chat_id, message_id, uid, user_message_id))
+    db.commit()
+
+
+async def crm_delete(m: Message, uid: int):
+    """/del реплаем на своё сообщение в теме: удаляет его у пользователя (Telegram позволяет ~48 часов)."""
+    target = m.reply_to_message
+    row = target and db.execute(
+        "SELECT user_message_id FROM crm_out WHERE chat_id=? AND message_id=? AND user_id=?",
+        (m.chat.id, target.message_id, uid)).fetchone()
+    if not row:
+        await m.reply("Ответьте командой /del на своё сообщение в этой теме, которое нужно удалить у пользователя.")
+        return
+    try:
+        await bot.delete_message(uid, row["user_message_id"])
+    except Exception:
+        logging.exception("не удалось удалить сообщение у пользователя %s", uid)
+        await m.reply("⚠️ Не удалось удалить: возможно, прошло больше 48 часов или сообщение уже удалено.")
+        return
+    db.execute("DELETE FROM crm_out WHERE chat_id=? AND message_id=?", (m.chat.id, target.message_id))
+    db.commit()
+    await m.reply("🗑 Удалено у пользователя.")
+
+
+async def crm_notify(uid: int, text: str):
+    """Короткая пометка в теме лида (например, об оплате). Ничего не делает, если темы нет."""
+    if not crm_topics_on():
+        return
+    r = db.execute("SELECT thread_id FROM crm_topics WHERE user_id=?", (uid,)).fetchone()
+    if not r:
+        return
+    try:
+        await bot.send_message(CRM_CHAT_ID, text, message_thread_id=r["thread_id"])
+    except Exception:
+        logging.warning("не удалось написать в CRM-тему %s", uid)
+
+
+T_RECEIPT = "Благодарим вас за покупку, вот ваш чек об оплате."
+CHEK_RE = r"^/chek(@\w+)?(\s|$)"
+
+
+@dp.message(F.from_user.id == ADMIN_ID, F.content_type.in_({"photo", "document"}), F.caption.regexp(CHEK_RE))
+async def cmd_chek(m: Message):
+    """Фото чека с подписью /chek 123456 (или /chek @ник) уходит этому человеку.
+    В теме лида в CRM-группе достаточно подписи /chek: чек уйдёт хозяину темы."""
+    parts = (m.caption or "").split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    uid = None
+    if arg:
+        uid = crm_resolve_user(arg)
+    elif CRM_CHAT_ID and m.chat.id == CRM_CHAT_ID and m.message_thread_id:
+        r = db.execute("SELECT user_id FROM crm_topics WHERE chat_id=? AND thread_id=?",
+                       (m.chat.id, m.message_thread_id)).fetchone()
+        uid = r["user_id"] if r else None
+    if uid is None:
+        await m.reply("Не нашёл, кому отправить. Подпишите фото так: /chek 123456 или /chek @ник, "
+                      "либо отправьте его в теме нужного человека.")
+        return
+    try:
+        if m.photo:
+            sent = await bot.send_photo(uid, m.photo[-1].file_id, caption=T_RECEIPT)
+        else:
+            sent = await bot.send_document(uid, m.document.file_id, caption=T_RECEIPT)
+    except Exception:
+        logging.exception("не удалось отправить чек пользователю %s", uid)
+        await m.reply("⚠️ Не удалось отправить: пользователь мог заблокировать бота.")
+        return
+    crm_out_save(m.chat.id, m.message_id, uid, sent.message_id)
+    db.execute("INSERT INTO crm_messages(user_id, direction, text, ts) VALUES(?,?,?,?)",
+               (uid, "out", "[чек об оплате]", int(time.time())))
+    db.commit()
+    await m.reply(f"✅ Чек отправлен: {html.escape(crm_display_name(uid))}")
+
+
+@dp.message(Command("chek"), F.from_user.id == ADMIN_ID)
+async def cmd_chek_help(m: Message):
+    await m.answer("Отправьте фото чека с подписью /chek 123456 (id) или /chek @ник. "
+                   "В теме лида в CRM-группе достаточно подписи /chek.")
+
+
+CRM_RELAY_TYPES = {"text", "photo", "video", "voice", "video_note", "audio", "document", "sticker", "animation"}
+
+
+@dp.message(F.chat.id == CRM_CHAT_ID)
+async def crm_group_message(m: Message):
+    """Админ пишет в теме лида: сообщение уходит пользователю. Остальное в CRM-группе игнорируем."""
+    if not m.from_user or m.from_user.id != ADMIN_ID or not m.message_thread_id:
+        return
+    if m.content_type not in CRM_RELAY_TYPES:
+        return
+    r = db.execute("SELECT user_id FROM crm_topics WHERE chat_id=? AND thread_id=?",
+                   (m.chat.id, m.message_thread_id)).fetchone()
+    if not r:
+        return
+    uid = r["user_id"]
+    if m.text and m.text.startswith("/"):
+        parts = m.text.split(maxsplit=1)
+        cmd = parts[0].split("@")[0].lower()
+        if cmd == "/pay":  # /pay или /pay свой текст
+            await crm_send_pay(m, uid, parts[1].strip() if len(parts) > 1 else "")
+        elif cmd == "/del":  # реплаем на своё сообщение: удалить его у пользователя
+            await crm_delete(m, uid)
+        elif cmd == "/reset":  # сбросить воронку этого человека на нулевой шаг
+            await crm_do_reset(m, uid)
+        elif cmd == "/erase":  # удалить этого человека из базы (с подтверждением)
+            await crm_ask_erase(m, uid)
+        return
+    try:
+        sent = await bot.copy_message(uid, m.chat.id, m.message_id)
+        crm_out_save(m.chat.id, m.message_id, uid, sent.message_id)
+    except Exception:
+        logging.exception("не удалось доставить сообщение пользователю %s", uid)
+        await m.reply("⚠️ Не удалось доставить: пользователь мог заблокировать бота.")
+        return
+    crm_log(uid, "out", m, sent.message_id)
+
+
+# ====================== НОВАЯ ВОРОНКА: урок -> предложение -> 5 вопросов -> урок 2 -> обратная связь -> заявка ======================
+# Этапы (funnel_users.stage): pick -> wait1 -> offer -> qa -> wait2 -> fb -> (fbreason) / fbtext -> done.
+# «Нет» на шаге offer или fb ведёт в closed (в CRM: «Не купил / закрыт», корзина). «Хочу продолжить» возвращает человека.
+# Тексты ниже можно менять свободно. Разметка HTML: <b>жирный</b>, <i>курсив</i>.
+FX_GREETING = "Привет! Я бот Круга Ильи Хабирова 👋"
+FX_PICK_Q = "<b>Какой бесплатный урок вы хотите получить?</b>"
+FX_LESSONS = [("1. Тени", "Тени")]  # (текст кнопки, название урока); пока урок один
+FX_LESSON1_CAPTION = "🎁 <b>Ваш бесплатный урок: «{name}»</b>"
+FX_TOMORROW = "Завтра напишу вам с новым интересным материалом по теме 🤝"
+FX_OFFER = ("А хотите ещё глубже узнать себя? Предлагаю вам ответить на несколько вопросов, а за это подарю "
+            "вам подробный урок, как найти у себя те качества, которые ушли в тень.")
+FX_BTN_YES = "✍️ Да, хочу ответить"
+FX_BTN_NO = "Нет, я получил что хотел"
+FX_CLOSED = ("Тогда более не беспокоим. Если захотите продолжить взаимодействие, нажмите на эту кнопку.")
+FX_BTN_RESUME = "▶️ Хочу продолжить"
+FX_RESUME_Q = "Рад, что вы вернулись! Что выбираете?"
+FX_BTN_ANSWER = "✍️ Ответить на вопросы"
+FX_BTN_BUY = "💳 Купить подписку"
+FX_BTN_TELL = "💬 Рассказать, что понравилось"
+FX_QA_INTRO = ("Отлично! Вас ждут 5 вопросов. Отвечайте своими словами, в свободной форме, "
+               "не менее трёх предложений: чем честнее и глубже, тем полезнее будет для вас результат.")
+# (заголовок, пояснение)
+FX_QUESTIONS = [
+    ("Что сейчас происходит в твоей жизни?",
+     "Какие вопросы, ситуации или внутренние противоречия занимают твои мысли в последнее время? "
+     "Есть ли что-то, что ты давно хочешь изменить в себе или своей жизни?"),
+    ("Что в себе тебе сложнее всего принять?",
+     "Может быть, это определённые эмоции, привычки, реакции, страхи, желания или качества характера. "
+     "Есть ли стороны своей личности, которые ты стараешься скрывать, подавлять или не показывать окружающим?"),
+    ("В каких ситуациях ты замечаешь, что действуешь не так, как на самом деле хочешь?",
+     "Например, подстраиваешься под других, боишься заявить о себе, откладываешь важные решения, "
+     "испытываешь внутренний конфликт или повторяешь одни и те же сценарии. Расскажи о конкретном примере, "
+     "если он есть."),
+    ("Каким человеком ты хотел бы стать и что хотел бы изменить в своём внутреннем состоянии?",
+     "Представь, что через полгода ты стал лучше понимать себя, свои желания, эмоции и реакции. "
+     "Что конкретно изменилось бы в твоём мышлении, поведении, отношениях и ощущении собственной жизни?"),
+    ("Что ты уже предпринимал для собственного развития и чего тебе сейчас не хватает, чтобы двигаться дальше?",
+     "Может быть, ты изучал психологию, Юнга, медитировал, проходил курсы, читал книги или работал самостоятельно. "
+     "Что помогало, что не давало результата и какая поддержка или среда могли бы тебе помочь?"),
+]
+FX_Q_SHORT = ["Что происходит в жизни", "Что сложнее всего принять", "Где действует не так, как хочет",
+              "Каким хочет стать", "Что уже предпринимал и чего не хватает"]
+# Ограничений по длине ответов нет: просьба о трёх предложениях только в тексте вопроса, бот ничего не отклоняет.
+FX_TEXT_ONLY = "Пожалуйста, напишите ответ текстом 🙏"
+FX_LESSON2_CAPTION = ("🎁 <b>Ваш подарок за ответы</b>\nУрок о том, как найти у себя те качества, "
+                      "которые ушли в тень.\n\nЗавтра я вам напишу 🤝")
+FX_FB_Q = "Скажите, как вам опыт в приложении? Получили ценность?"
+FX_BTN_VAL_YES = "👍 Да"
+FX_BTN_VAL_NO = "👎 Нет"
+FX_WHY = "Жаль это слышать. Скажите, пожалуйста, почему?"
+FX_NO_REASONS = ["Материал оказался не по моей теме", "Было слишком сложно или непонятно",
+                 "Не хватило практики и конкретных шагов", "Сейчас нет времени заниматься", "Другое"]
+FX_WHY_OTHER = "Напишите, пожалуйста, своими словами 👇"
+FX_FB_TEXT = ("Расскажите, а что вам особенно понравилось, за это я подарю вам эксклюзивный подарок. "
+              "Какой, узнаете после ответа 😁\n\nОпишите, пожалуйста, подробно. Пишите в свободной форме, от сердца.")
+FX_DONE = "Отлично, на днях я вернусь к вам с персональным подарком от Ильи Хабирова 🎁"
+FX_WAIT_NOTE = "Вы уже на пути 🙌 Следующее сообщение придёт автоматически, ничего делать не нужно."
+FX_ALREADY_DONE = "Ваша заявка уже у меня 🙌 Илья скоро свяжется с вами лично."
+FX_DELAY_1_H = float(os.getenv("FUNNEL_DELAY_1_H", "24"))  # через сколько часов после урока 1 предложить вопросы
+FX_DELAY_2_H = float(os.getenv("FUNNEL_DELAY_2_H", "24"))  # через сколько часов после урока 2 спросить про опыт
+FX_V2_STAGES = ("pick", "wait1", "offer", "qa", "wait2", "fb", "fbreason", "fbtext", "closed")
+
+
+def fx_video_ref(key) -> str:
+    """Видео по слоту: "1", "2"... (номер бесплатного урока в FX_LESSONS) или "gift" (подарок после ответов).
+    file_id берётся из базы (админ присылает видео боту с подписью) либо из переменной FUNNEL_VIDEO_<слот>."""
+    key = str(key)
+
+    def one(k):
+        r = db.execute("SELECT v FROM meta WHERE k=?", (f"funnel_video_{k}",)).fetchone()
+        return (r["v"] if r else "") or os.getenv(f"FUNNEL_VIDEO_{k.upper()}", "")
+    v = one(key)
+    if not v and key == "gift" and len(FX_LESSONS) == 1:  # раньше подарок хранился как «2»
+        v = one("2")
+    if not v and key == "1":
+        v = FUNNEL_VIDEO
+    return v.strip()
+
+
+def fx_video_label(key) -> str:
+    key = str(key)
+    if key == "gift":
+        return "подарка (урок после ответов на вопросы)"
+    try:
+        return f"урока {key} («{FX_LESSONS[int(key) - 1][1]}»)"
+    except (ValueError, IndexError):
+        return f"урока {key}"
+
+
+def fx_log(uid: int, text: str):
+    crm_sys(uid, "🤖 " + text)
+
+
+def fx_log_in(uid: int, m: Message):
+    """Ответ человека на шаге воронки пишем в переписку CRM, но «новым сообщением» для вас не считаем."""
+    n = db.execute("SELECT COUNT(*) FROM crm_messages m LEFT JOIN crm_seen s ON s.user_id=m.user_id "
+                   "WHERE m.user_id=? AND m.direction='in' AND m.ts>COALESCE(s.ts,0)", (uid,)).fetchone()[0]
+    crm_log(uid, "in", m)
+    if n == 0:
+        db.execute("INSERT OR REPLACE INTO crm_seen(user_id, ts) VALUES(?,?)", (uid, int(time.time())))
+        db.commit()
+
+
+async def fx_send(uid: int, text: str, kb=None) -> bool:
+    try:
+        await bot.send_message(uid, text, reply_markup=kb)
+        return True
+    except Exception:
+        logging.warning("воронка: не удалось отправить сообщение %s (бот заблокирован?)", uid)
+        return False
+
+
+async def fx_send_lesson(uid: int, n, caption: str):
+    v = fx_video_ref(n)
+    if v and not v.startswith("http"):
+        try:
+            await bot.send_video(uid, v, caption=caption)
+            return
+        except Exception:
+            logging.exception("воронка: не удалось отправить видео урока %s", n)
+    if not v:
+        await safe_send(ADMIN_ID, f"⚠️ Не задано видео {fx_video_label(n)}. Отправьте видео этому боту с подписью "
+                                  f"«{'подарок' if str(n) == 'gift' else n}».")
+    await bot.send_message(uid, caption + (f"\n\n{v}" if v.startswith("http") else "\n\n(видео скоро добавлю)"))
+
+
+# --- конструкторы сообщений: (текст, клавиатура) ---
+def fx_m_offer():
+    return FX_OFFER, markup([btn(FX_BTN_YES, "fx:yes")], [btn(FX_BTN_NO, "fx:no")])
+
+
+def fx_m_question(step: int):
+    title, details = FX_QUESTIONS[step]
+    return (f"<b>Вопрос {step + 1} из {len(FX_QUESTIONS)}</b>\n\n<b>{html.escape(title)}</b>\n{html.escape(details)}"
+            f"\n\n<i>Ответьте сообщением, не менее трёх предложений.</i>"), None
+
+
+def fx_m_fb():
+    return FX_FB_Q, markup([btn(FX_BTN_VAL_YES, "fx:v:y"), btn(FX_BTN_VAL_NO, "fx:v:n")])
+
+
+def fx_m_why():
+    return FX_WHY, markup(*[[btn(o, f"fx:r:{i}")] for i, o in enumerate(FX_NO_REASONS)])
+
+
+def fx_m_closed():
+    return FX_CLOSED, markup([btn(FX_BTN_RESUME, "fx:resume")])
+
+
+def fx_m_resume(frm: str):
+    if frm == "fb":
+        return FX_RESUME_Q, markup([btn(FX_BTN_TELL, "fx:tell")], [btn(FX_BTN_BUY, "fx:buy")])
+    return FX_RESUME_Q, markup([btn(FX_BTN_ANSWER, "fx:qa")], [btn(FX_BTN_BUY, "fx:buy")])
+
+
+def fx_save(uid: int, a: dict, **fields):
+    funnel_update(uid, answers=json.dumps(a, ensure_ascii=False), **fields)
+
+
+def fx_close(uid: int, frm: str, why: str):
+    """«Закрыто и не реализовано»: человек сам отказался. В CRM лид серый и уходит в корзину."""
+    row = funnel_get(uid)
+    a = funnel_answers(row)
+    a["closed_from"] = frm
+    crm_sys(uid, why)  # сначала событие, потом стадия «закрыт» (иначе событие тут же вернуло бы лида из корзины)
+    fx_save(uid, a, stage="closed", next_at=0)
+    t = int(time.time())
+    db.execute("INSERT INTO crm_leads(user_id, stage, trashed_at, updated) VALUES(?,?,?,?) "
+               "ON CONFLICT(user_id) DO UPDATE SET stage='lost', trashed_at=excluded.trashed_at, "
+               "updated=excluded.updated", (uid, "lost", t, t))
+    db.commit()
+
+
+async def fx_start_qa(uid: int):
+    row = funnel_get(uid)
+    a = funnel_answers(row)
+    a.setdefault("t_qa", int(time.time()))
+    fx_save(uid, a, stage="qa", step=0, tmp="[]", next_at=0)
+    fx_log(uid, "Предложил ответить на 5 вопросов, человек согласился")
+    await bot.send_message(uid, FX_QA_INTRO)
+    await bot.send_message(uid, fx_m_question(0)[0])
+
+
+async def fx_qa_finished(uid: int):
+    """Ответил на все 5 вопросов: подарок (урок 2), завтра спросим про опыт."""
+    t = int(time.time())
+    a = funnel_answers(funnel_get(uid))
+    a["t_lesson2"] = t
+    fx_save(uid, a, stage="wait2", next_at=t + int(FX_DELAY_2_H * 3600), step=len(FX_QUESTIONS))
+    fx_log(uid, "Ответил на все 5 вопросов, отправил урок 2")
+    await fx_send_lesson(uid, "gift", FX_LESSON2_CAPTION)
+
+
+async def fx_send_offer(uid: int):
+    text, kb = fx_m_offer()
+    funnel_update(uid, stage="offer", next_at=0)
+    if await fx_send(uid, text, kb):
+        fx_log(uid, "Предложил ответить на вопросы за подарок")
+
+
+async def fx_send_fb(uid: int):
+    text, kb = fx_m_fb()
+    funnel_update(uid, stage="fb", next_at=0)
+    if await fx_send(uid, text, kb):
+        fx_log(uid, "Спросил про опыт в приложении")
+
+
+async def fx_finish(uid: int):
+    """Все данные собраны: заявка готова, лид зелёный, вам приходит уведомление и карточка."""
+    funnel_update(uid, stage="done", done=1, tmp="[]", done_at=int(time.time()), series_idx=0, next_at=0)
+    crm_sys(uid, "✅ Прошёл квалификацию: ответил на 5 вопросов и дал обратную связь")
+    await fx_send(uid, FX_DONE)
+    existed = crm_topics_on() and db.execute("SELECT 1 FROM crm_topics WHERE user_id=?", (uid,)).fetchone() is not None
+    thread = await crm_topic(uid)  # новая тема сразу создаётся с полной карточкой
+    if thread and existed:  # тема уже была: добавляем полную карточку и обновляем название
+        try:
+            await crm_post_card(uid, thread)
+            _, name, seg = await funnel_build_card(uid)
+            await bot.edit_forum_topic(CRM_CHAT_ID, thread, name=crm_topic_title(name, seg))
+        except Exception:
+            logging.exception("не удалось обновить тему лида")
+    card, name, _ = await funnel_build_card(uid)
+    kb = crm_open_kb(uid)
+    rows = [[btn("✉️ Написать ему", f"users:message:{uid}:0")]]
+    if kb:
+        rows.append(kb.inline_keyboard[0])
+    try:
+        text = (f"🟢 <b>Новая заявка готова к работе:</b> {html.escape(name)}\nОтветы и карточка в CRM." if thread
+                else card)
+        await bot.send_message(ADMIN_ID, text[:4000], reply_markup=markup(*rows))
+    except Exception:
+        logging.exception("не удалось отправить уведомление о новой заявке")
+
+
+async def fx_resend(uid: int, row):
+    """Человек снова открыл ссылку воронки: повторяем текущий шаг, а не начинаем сначала."""
+    stage, a = row["stage"], funnel_answers(row)
+    if stage == "done":
+        await fx_send(uid, FX_ALREADY_DONE)
+    elif stage in ("wait1", "wait2"):
+        await fx_send(uid, FX_WAIT_NOTE)
+    elif stage == "offer":
+        await fx_send(uid, *fx_m_offer())
+    elif stage == "qa":
+        await fx_send(uid, fx_m_question(min(row["step"], len(FX_QUESTIONS) - 1))[0])
+    elif stage == "fb":
+        await fx_send(uid, *fx_m_fb())
+    elif stage == "fbreason":
+        await fx_send(uid, *fx_m_why())
+    elif stage == "fbtext":
+        await fx_send(uid, FX_FB_TEXT)
+    elif stage == "closed":
+        await fx_send(uid, *fx_m_closed())
+
+
+async def check_funnel():
+    """Раз в минуту: по таймеру отправляем предложение вопросов (после урока 1) и вопрос про опыт (после урока 2)."""
+    t = int(time.time())
+    for r in db.execute("SELECT user_id, stage FROM funnel_users WHERE next_at>0 AND next_at<=? "
+                        "AND stage IN ('wait1','wait2')", (t,)).fetchall():
+        uid = r["user_id"]
+        try:
+            if active_subscription(uid):  # уже купил: воронку не продолжаем
+                funnel_update(uid, stage="done", done=1, next_at=0)
+            elif r["stage"] == "wait1":
+                await fx_send_offer(uid)
+            else:
+                await fx_send_fb(uid)
+        except Exception:
+            logging.exception("воронка: ошибка шага для %s", uid)
+            funnel_update(uid, next_at=0)
+
+
+async def fx_text(m: Message, row) -> bool:
+    """Текстовые ответы на шагах воронки. True = сообщение обработано здесь."""
+    a = funnel_answers(row)
+    if a.get("flow") != "v2":
+        return False
+    uid, stage = m.from_user.id, row["stage"]
+    if stage not in ("qa", "fbtext", "fbreason"):
+        return False
+    if not m.text:
+        await m.answer(FX_TEXT_ONLY)
+        return True
+    text = m.text.strip()
+    fx_log_in(uid, m)
+    if stage == "qa":
+        step = row["step"]
+        a[f"q{step + 1}"] = text
+        if step + 1 < len(FX_QUESTIONS):
+            fx_save(uid, a, step=step + 1)
+            await m.answer(fx_m_question(step + 1)[0])
+        else:
+            fx_save(uid, a)
+            await fx_qa_finished(uid)
+    elif stage == "fbtext":
+        a["fb_value"], a["fb_text"] = "yes", text
+        fx_save(uid, a)
+        await fx_finish(uid)
+    else:  # fbreason: причина своими словами
+        a["fb_reason"] = text
+        fx_save(uid, a)
+        fx_close(uid, "fb", "🚪 Закрыт: опыт без ценности, причина: " + funnel_trunc(text, 80))
+        await m.answer(*fx_m_closed()[:1], reply_markup=fx_m_closed()[1])
+    return True
+
+
+@dp.callback_query(F.data.startswith("fx:"))
+async def fx_callback(cb: CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    row = funnel_get(uid)
+    if not row:
+        return
+    parts = cb.data.split(":")
+    act, stage = parts[1], row["stage"]
+    a = funnel_answers(row)
+    if act == "l" and stage == "pick":  # выбрал бесплатный урок
+        try:
+            name = FX_LESSONS[int(parts[2])][1]
+        except (ValueError, IndexError):
+            return
+        t = int(time.time())
+        a.update(lesson=name, t_lesson1=t)
+        fx_save(uid, a, stage="wait1", next_at=t + int(FX_DELAY_1_H * 3600))
+        await funnel_clear_buttons(cb)
+        fx_log(uid, f"Отправил бесплатный урок «{name}»")
+        await fx_send_lesson(uid, str(int(parts[2]) + 1), FX_LESSON1_CAPTION.format(name=html.escape(name)))
+        await bot.send_message(uid, FX_TOMORROW)
+    elif act == "yes" and stage == "offer":
+        await funnel_clear_buttons(cb)
+        await fx_start_qa(uid)
+    elif act == "no" and stage == "offer":
+        await funnel_clear_buttons(cb)
+        fx_close(uid, "offer", "🚪 Закрыт: получил урок и не захотел отвечать на вопросы")
+        await bot.send_message(uid, *fx_m_closed()[:1], reply_markup=fx_m_closed()[1])
+    elif act == "resume" and stage == "closed":
+        await funnel_clear_buttons(cb)
+        text, kb = fx_m_resume(a.get("closed_from", "offer"))
+        await bot.send_message(uid, text, reply_markup=kb)
+    elif act == "qa" and stage == "closed":
+        await funnel_clear_buttons(cb)
+        await fx_start_qa(uid)
+    elif act == "tell" and stage == "closed":
+        await funnel_clear_buttons(cb)
+        funnel_update(uid, stage="fbtext")
+        await bot.send_message(uid, FX_FB_TEXT)
+    elif act == "buy" and stage == "closed":
+        await funnel_clear_buttons(cb)
+        fx_log(uid, "Человек выбрал «Купить подписку», отправил форму оплаты")
+        await show_product(uid, None)
+    elif act == "v" and stage == "fb":
+        await funnel_clear_buttons(cb)
+        if parts[2] == "y":
+            funnel_update(uid, stage="fbtext")
+            await bot.send_message(uid, FX_FB_TEXT)
+        else:
+            funnel_update(uid, stage="fbreason")
+            await bot.send_message(uid, *fx_m_why()[:1], reply_markup=fx_m_why()[1])
+    elif act == "r" and stage == "fbreason":
+        try:
+            reason = FX_NO_REASONS[int(parts[2])]
+        except (ValueError, IndexError):
+            return
+        if reason == "Другое":
+            await bot.send_message(uid, FX_WHY_OTHER)
+            return
+        await funnel_clear_buttons(cb)
+        a.update(fb_value="no", fb_reason=reason)
+        fx_save(uid, a)
+        fx_close(uid, "fb", "🚪 Закрыт: опыт без ценности, причина: " + reason)
+        await bot.send_message(uid, *fx_m_closed()[:1], reply_markup=fx_m_closed()[1])
+
+
+@dp.message(Command("videos"), F.from_user.id == ADMIN_ID, F.chat.type == "private")
+async def cmd_videos(m: Message):
+    """Какие видео воронки заданы."""
+    lines = ["🎬 <b>Видео воронки</b>", ""]
+    for i, (_, name) in enumerate(FX_LESSONS):
+        lines.append(f"{'✅' if fx_video_ref(str(i + 1)) else '❌'} Урок {i + 1}: {html.escape(name)}")
+    lines.append(f"{'✅' if fx_video_ref('gift') else '❌'} Подарок (урок после ответов на вопросы)")
+    lines += ["", "Задать или заменить: отправьте боту видео с подписью: номер урока (1, 2...) или слово «подарок»."]
+    await m.answer("\n".join(lines))
+
+
+@dp.message(Command("fskip"), F.from_user.id == ADMIN_ID, F.chat.type == "private")
+async def cmd_fskip(m: Message):
+    """Для проверки воронки: не ждать сутки, сразу выполнить ожидающий шаг (свой тестовый проход)."""
+    row = funnel_get(ADMIN_ID)
+    if not row or row["stage"] not in ("wait1", "wait2"):
+        await m.answer("Нет ожидающего шага. Начните воронку ссылкой t.me/бот?start=insta.")
+        return
+    funnel_update(ADMIN_ID, next_at=1)
+    await check_funnel()
+
+
+@dp.message(F.from_user.id == ADMIN_ID, F.chat.type == "private", F.video)
+async def funnel_video_id(m: Message):
+    """Видео с подписью: номер урока (1, 2...) или «подарок» сохраняется в воронку. Без подписи: показывает file_id."""
+    cap = (m.caption or "").strip().lower()
+    key = None
+    if cap in ("подарок", "gift"):
+        key = "gift"
+    elif cap.isdigit():
+        n = int(cap)
+        if n == 2 and len(FX_LESSONS) == 1:  # урок в списке один, значит «2» = подарок (как было раньше)
+            key = "gift"
+        elif 1 <= n <= len(FX_LESSONS):
+            key = str(n)
+    if key:
+        db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (f"funnel_video_{key}", m.video.file_id))
+        db.commit()
+        await m.answer(f"✅ Видео {fx_video_label(key)} сохранено. Новые лиды получат именно его.")
+        return
+    await m.answer("Чтобы сохранить видео в воронку, отправьте его с подписью: номер урока (1, 2...) "
+                   "или слово «подарок». Список заданных видео: /videos")
+    await m.answer(f"file_id видео (вставьте в переменную FUNNEL_VIDEO):\n<code>{m.video.file_id}</code>")
+
+
+async def funnel_chat_filter(m: Message) -> bool:
+    """Сообщения людей из воронки: ответы теста текстом и переписка с администратором."""
+    uid = m.from_user.id
+    if m.chat.type != "private":
+        return False
+    if m.text and m.text.startswith("/"):
+        return False
+    if uid in awaiting_help:
+        return False
+    if active_subscription(uid) and not db.execute(
+            "SELECT 1 FROM crm_topics WHERE user_id=?", (uid,)).fetchone():
+        return False  # оплатившие без темы в CRM идут по старой логике
+    if m.reply_to_message and support_user(uid, m.reply_to_message.message_id) == uid:
+        return False  # ответ на сообщение админа: обработает any_message
+    row = funnel_get(uid)
+    if not row:
+        return False
+    if uid == ADMIN_ID and (m.reply_to_message or row["stage"] == "done" or not m.text):
+        return False  # админ не должен «застревать» в воронке при ответах и /restore
+    return True
+
+
+async def funnel_relay(m: Message):
+    """Сообщение человека администратору: в его тему CRM, а если CRM не настроена, в личку."""
+    uid = m.from_user.id
+    crm_log(uid, "in", m)
+    thread = await crm_topic(uid)
+    if thread:
+        try:
+            await bot.copy_message(CRM_CHAT_ID, uid, m.message_id, message_thread_id=thread)
+        except Exception:
+            logging.exception("не удалось переслать сообщение в CRM-тему")
+        return
+    who = html.escape(m.from_user.full_name) + (f" (@{html.escape(m.from_user.username)})"
+                                                 if m.from_user.username else "")
+    header = await bot.send_message(
+        ADMIN_ID, f"💬 Сообщение от {who}, id <code>{uid}</code>.\n"
+                  "Ответьте реплаем на это сообщение или на пересланное.",
+        reply_markup=crm_open_kb(uid))
+    link_support_message(ADMIN_ID, header.message_id, uid)
+    forwarded = await m.copy_to(ADMIN_ID)
+    link_support_message(ADMIN_ID, forwarded.message_id, uid)
+
+
+@dp.message(funnel_chat_filter)
+async def funnel_message(m: Message):
+    """Ответы теста текстом принимаем как ответы. Всё остальное пересылаем админу: человек не «застревает»."""
+    uid = m.from_user.id
+    row = funnel_get(uid)
+    stage = row["stage"]
+    paid = bool(active_subscription(uid))
+    if await fx_text(m, row):  # ответы новой воронки (5 вопросов, обратная связь)
+        return
+    if stage == "test" and not paid:
+        q = FUNNEL_TEST[row["step"]]
+        if m.text and q["free"]:
+            funnel_set_answer(uid, q["key"], m.text.strip(), -1)
+            await funnel_next(uid)
+            return
+    await funnel_relay(m)
+    if stage == "done" or paid:
+        if row["tmp"] != '["ack"]':
+            funnel_update(uid, tmp='["ack"]')
+            await m.answer("Передал администратору. Ответ придёт сюда.")
+        return
+    key = (uid, stage, row["step"])
+    if key in FUNNEL_HINTED:
+        return
+    FUNNEL_HINTED.add(key)
+    if stage in ("wait1", "wait2"):
+        hint = "Следующий материал пришлю автоматически 🤝"
+    elif stage in ("pick", "offer", "fb", "closed", "fbreason"):
+        hint = "Нажмите на кнопку выше 👆"
+    elif stage == "test":
+        hint = "Выберите вариант кнопкой выше 👆"
+    else:
+        hint = "Нажмите на кнопку выше 👆, чтобы я подобрал для вас урок."
+    await m.answer("Передал ваше сообщение администратору 🙌 " + hint)
+
+
+# ====================== конец блока FUNNEL ======================
 
 
 # ---------- Копии базы (под вашим контролем) ----------
@@ -771,6 +2366,7 @@ async def admin_reply(m: Message):
             await m.answer("Не удалось отправить сообщение: пользователь мог заблокировать бота.")
             return
         link_support_message(target_uid, sent.message_id, target_uid)
+        crm_log(target_uid, "out", m, sent.message_id)
         awaiting_compose.pop(ADMIN_ID, None)
         await m.answer("✅ Сообщение отправлено. Ответ пользователя придёт сюда; отвечайте на него реплаем.")
         return
@@ -790,6 +2386,7 @@ async def admin_reply(m: Message):
     try:
         sent = await m.copy_to(uid)
         link_support_message(uid, sent.message_id, uid)
+        crm_log(uid, "out", m, sent.message_id)
         await m.answer("✅ Отправлено. Пользователь сможет ответить реплаем на это сообщение.")
     except Exception:
         logging.exception("не удалось отправить ответ пользователю %s", uid)
@@ -802,6 +2399,31 @@ async def status(m: Message):
     ensure_user(m.from_user.id, m.from_user.username)
     text, keyboard = subscription_status(m.from_user.id)
     await m.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "status")
+async def status_btn(cb: CallbackQuery):
+    ensure_user(cb.from_user.id, cb.from_user.username)
+    text, keyboard = subscription_status(cb.from_user.id)
+    await cb.message.answer(text, reply_markup=keyboard)
+    await cb.answer()
+
+
+@dp.message(Command("unsubscribe"))
+async def unsubscribe(m: Message):
+    """Отказ от рекламной рассылки в любой момент. Служебные сообщения (доступ, оплата) продолжают приходить."""
+    uid = m.from_user.id
+    ensure_user(uid, m.from_user.username)
+    row = db.execute("SELECT ads_optout FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not (row and row["ads_optout"]):
+        db.execute("UPDATE users SET ads_optout=1 WHERE user_id=?", (uid,))
+        db.commit()
+        try:
+            crm_sys(uid, "🔕 Отказался от рекламной рассылки (/unsubscribe)")
+        except Exception:
+            logging.exception("не удалось записать отписку в CRM")
+    await m.answer("Вы отказались от рекламной рассылки. Служебные уведомления (доступ, оплата, "
+                   "напоминания о подписке) будут приходить по-прежнему.")
 
 
 def admin_menu():
@@ -1269,7 +2891,7 @@ async def broadcast(m: Message, active_only: bool):
         await m.answer(f"Формат: {command} текст сообщения")
         return
     body = html.escape(parts[1].strip())
-    query = "SELECT user_id FROM users WHERE blocked=0 AND user_id!=?"
+    query = "SELECT user_id FROM users WHERE blocked=0 AND COALESCE(ads_optout,0)=0 AND user_id!=?"
     params: tuple = (ADMIN_ID,)
     if active_only:
         query += " AND active=1 AND expires_at>?"
@@ -1364,12 +2986,14 @@ async def stats(m: Message):
     ).fetchone()[0] if AUTOCHARGE else 0
     pending_auto = db.execute("SELECT COUNT(*) FROM pending WHERE is_auto=1").fetchone()[0]
     stuck = db.execute("SELECT COUNT(*) FROM users WHERE active=0 AND pay_started_at IS NOT NULL").fetchone()[0]
+    funnel_done = db.execute("SELECT COUNT(*) FROM funnel_users WHERE done=1").fetchone()[0]
     await m.answer(
         f"Активных подписчиков: {n}\nВсего оплат: {s}\n"
         f"Автосписание включено в настройках: {'да' if AUTOCHARGE else 'нет'}\n"
         f"Активных подписок с автопродлением в текущем магазине: {recurring}\n"
         f"Ожидающих автоплатежей: {pending_auto}\n"
         f"Дошли до оплаты, но не оплатили: {stuck}\n"
+        f"Прошли квалификацию в воронке: {funnel_done}\n"
         f"Файл базы: {os.path.abspath(DB_PATH)}"
     )
 
@@ -1392,6 +3016,7 @@ async def any_message(m: Message):
             link_support_message(ADMIN_ID, header.message_id, uid)
             forwarded = await m.copy_to(ADMIN_ID)
             link_support_message(ADMIN_ID, forwarded.message_id, uid)
+            crm_log(uid, "in", m)
             await m.answer("Ваш ответ передан. Мы ответим вам сюда.")
             return
     if uid in awaiting_help:
@@ -1400,6 +3025,7 @@ async def any_message(m: Message):
         head = await bot.send_message(
             ADMIN_ID, f"💬 Вопрос от {who}, id <code>{uid}</code>.\nОтветьте реплаем на это сообщение или на следующее.")
         copy = await m.copy_to(ADMIN_ID)
+        crm_log(uid, "in", m)
         db.executemany("INSERT OR REPLACE INTO help VALUES(?,?)", [(head.message_id, uid), (copy.message_id, uid)])
         db.commit()
         await m.answer(T_HELP_SENT)
@@ -1440,7 +3066,7 @@ async def check_pending_methods():
 async def check_stuck():
     """Дошёл до оплаты, но через STUCK_HOURS так и не оплатил: один раз напоминаем."""
     limit = iso(now() - timedelta(hours=STUCK_HOURS))
-    for u in db.execute("SELECT user_id FROM users WHERE active=0 AND stuck_reminded=0 "
+    for u in db.execute("SELECT user_id FROM users WHERE active=0 AND stuck_reminded=0 AND COALESCE(ads_optout,0)=0 "
                         "AND pay_started_at IS NOT NULL AND pay_started_at<=?", (limit,)).fetchall():
         db.execute("UPDATE users SET stuck_reminded=1 WHERE user_id=?", (u["user_id"],))
         db.commit()
@@ -1514,6 +3140,205 @@ async def check_daily_report():
     db.commit()
 
 
+# ---------- Автоочистка CRM ----------
+# Что чистим и что НЕ трогаем:
+#  • Лид в стадии «Не купил / закрыт» попадает в корзину; через CRM_TRASH_DAYS дней удаляются переписка,
+#    заметки, профиль теста и тема в CRM-группе. В списке остаётся серая запись с короткой справкой
+#    (имя, сегмент, источник, дата входа). Если человек снова напишет или нажмёт кнопку, он возвращается в работу.
+#  • У покупателей серые события (нажатия, команды) старше CRM_BUYER_SYS_DAYS дней удаляются.
+#  • У остальных серые события старше CRM_SYS_DAYS дней удаляются.
+#  • Всегда остаются: строки о прохождении теста (✅) и об оплате подписки (💳), живая переписка
+#    (кроме корзины), заметки (кроме корзины), таблица оплат и пользователи.
+#  • CRM_STALE_DAYS > 0: лиды, которые зашли, но не прошли тест и не проявляют активности столько дней,
+#    сами уходят в корзину (по умолчанию выключено).
+CRM_KEEP_SQL = "text NOT LIKE '✅%' AND text NOT LIKE '💳%'"
+CRM_BUYERS_SQL = ("SELECT user_id FROM users WHERE active=1 UNION SELECT user_id FROM payments "
+                  "UNION SELECT user_id FROM crm_leads WHERE stage='won'")
+
+
+async def crm_purge(uid: int):
+    """Очистка лида из корзины: данные удаляются, остаётся короткая справка."""
+    f = funnel_get(uid)
+    u = db.execute("SELECT joined_at FROM users WHERE user_id=?", (uid,)).fetchone()
+    bits = []
+    if f:
+        try:
+            bits.append("сегмент: " + FUNNEL_SEGMENTS[funnel_segment(funnel_answers(f))][0] if f["done"]
+                        else "тест не закончен")
+        except Exception:
+            pass
+        if f["source"]:
+            bits.append("источник: " + funnel_source_label(f["source"]))
+    if u and u["joined_at"]:
+        bits.append("зашёл " + u["joined_at"][:10])
+    n_msg = db.execute("SELECT COUNT(*) FROM crm_messages WHERE user_id=? AND direction!='sys'", (uid,)).fetchone()[0]
+    if n_msg:
+        bits.append(f"сообщений в переписке было: {n_msg}")
+    t = db.execute("SELECT chat_id, thread_id FROM crm_topics WHERE user_id=?", (uid,)).fetchone()
+    if t:
+        try:
+            await bot.delete_forum_topic(chat_id=t["chat_id"], message_thread_id=t["thread_id"])
+        except Exception:
+            logging.warning("не удалось удалить тему CRM лида %s", uid)
+    for q in ("DELETE FROM crm_messages WHERE user_id=?", "DELETE FROM crm_notes WHERE user_id=?",
+              "DELETE FROM crm_seen WHERE user_id=?", "DELETE FROM crm_topics WHERE user_id=?",
+              "DELETE FROM crm_out WHERE user_id=?", "DELETE FROM funnel_users WHERE user_id=?"):
+        db.execute(q, (uid,))
+    db.execute("UPDATE crm_leads SET purged_at=?, summary=?, trashed_at=0 WHERE user_id=?",
+               (int(time.time()), "; ".join(bits), uid))
+    db.commit()
+
+
+async def check_cleanup():
+    """Раз в сутки: корзина и серые события, чтобы база не разрасталась."""
+    r = db.execute("SELECT v FROM meta WHERE k='last_cleanup'").fetchone()
+    if r and datetime.fromisoformat(r["v"]) > now() - timedelta(hours=20):
+        return
+    db.execute("INSERT OR REPLACE INTO meta VALUES('last_cleanup', ?)", (iso(now()),))
+    db.commit()
+    t = int(time.time())
+    trashed = 0
+    if CRM_STALE_DAYS > 0:  # давно ничего не делают и не дошли до конца теста: в корзину
+        for row in db.execute(
+                """SELECT u.user_id FROM users u
+                   LEFT JOIN funnel_users f ON f.user_id=u.user_id
+                   LEFT JOIN crm_leads l ON l.user_id=u.user_id
+                   WHERE u.user_id!=? AND u.active=0 AND u.joined_at IS NOT NULL
+                     AND (f.user_id IS NULL OR f.done=0)
+                     AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.user_id=u.user_id)
+                     AND (l.user_id IS NULL OR l.stage NOT IN ('entered','series','ready','won','lost'))
+                     AND COALESCE((SELECT MAX(ts) FROM crm_messages m WHERE m.user_id=u.user_id),
+                                  CAST(strftime('%s', u.joined_at) AS INTEGER), 0) < ?""",
+                (ADMIN_ID, t - CRM_STALE_DAYS * 86400)).fetchall():
+            db.execute("INSERT INTO crm_leads(user_id, stage, trashed_at, updated) VALUES(?,?,?,?) "
+                       "ON CONFLICT(user_id) DO UPDATE SET stage='lost', trashed_at=excluded.trashed_at, "
+                       "updated=excluded.updated", (row["user_id"], "lost", t, t))
+            db.execute("INSERT INTO crm_messages(user_id, direction, text, ts) VALUES(?,?,?,?)",
+                       (row["user_id"], "sys", f"🗑 Автокорзина: нет активности {CRM_STALE_DAYS} дн.", t))
+            trashed += 1
+        db.commit()
+    purged = 0
+    for row in db.execute(f"SELECT user_id FROM crm_leads WHERE stage='lost' AND trashed_at>0 AND trashed_at<? "
+                          f"AND purged_at=0 AND user_id NOT IN ({CRM_BUYERS_SQL})",
+                          (t - CRM_TRASH_DAYS * 86400,)).fetchall():
+        try:
+            await crm_purge(row["user_id"])
+            purged += 1
+        except Exception:
+            logging.exception("не удалось очистить лида %s", row["user_id"])
+    c1 = db.execute(f"DELETE FROM crm_messages WHERE direction='sys' AND ts<? AND {CRM_KEEP_SQL} "
+                    f"AND user_id IN ({CRM_BUYERS_SQL})", (t - CRM_BUYER_SYS_DAYS * 86400,)).rowcount
+    c2 = db.execute(f"DELETE FROM crm_messages WHERE direction='sys' AND ts<? AND {CRM_KEEP_SQL}",
+                    (t - CRM_SYS_DAYS * 86400,)).rowcount if CRM_SYS_DAYS > 0 else 0
+    db.commit()
+    logging.info("Автоочистка CRM: в корзину %s, очищено %s, серых событий удалено %s", trashed, purged, c1 + c2)
+    if purged or c1 + c2 >= 500 or trashed:
+        await safe_send(ADMIN_ID, f"🧹 Автоочистка CRM: в корзину автоматически {trashed}, очищено лидов {purged}, "
+                                  f"удалено серых событий {c1 + c2}.")
+    v = db.execute("SELECT v FROM meta WHERE k='last_vacuum'").fetchone()
+    if (purged or c1 + c2 >= 1000) and not (v and datetime.fromisoformat(v["v"]) > now() - timedelta(days=7)):
+        try:  # возвращает место на диске, иначе файл базы не уменьшается
+            db.execute("VACUUM")
+            db.execute("INSERT OR REPLACE INTO meta VALUES('last_vacuum', ?)", (iso(now()),))
+            db.commit()
+        except Exception:
+            logging.exception("VACUUM не удался")
+
+
+# ---------- Сброс воронки и удаление человека (для тестов и уборки) ----------
+def crm_display_name(uid: int) -> str:
+    r = db.execute("SELECT name FROM crm_profiles WHERE user_id=?", (uid,)).fetchone()
+    if r and r["name"]:
+        return r["name"]
+    u = db.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
+    return f"@{u['username']}" if u and u["username"] else str(uid)
+
+
+def crm_forget_state(uid: int):
+    awaiting_help.discard(uid)
+    awaiting_compose.pop(uid, None)
+    awaiting_custom_days.pop(uid, None)
+
+
+async def fx_begin(uid: int):
+    """Первый шаг воронки: приветствие и выбор бесплатного урока."""
+    await bot.send_message(uid, FX_PICK_Q, reply_markup=markup(
+        *[[btn(label, f"fx:l:{i}")] for i, (label, _) in enumerate(FX_LESSONS)]))
+
+
+async def crm_reset_lead(uid: int, start: bool = False):
+    """Воронка с нулевого шага. Подписка, платежи, переписка и заметки остаются.
+    start=True (свой тест): сразу присылает первый шаг. Для чужого человека ему ничего не отправляется:
+    когда он снова откроет ссылку воронки, начнёт сначала."""
+    row = db.execute("SELECT source FROM funnel_users WHERE user_id=?", (uid,)).fetchone()
+    if start:
+        db.execute("INSERT OR IGNORE INTO users(user_id, joined_at) VALUES(?,?)", (uid, iso(now())))
+    if row or start:
+        funnel_reset(uid, (row["source"] if row and row["source"] else FUNNEL_PREFIX))
+    db.execute("DELETE FROM crm_messages WHERE user_id=? AND direction='sys'", (uid,))
+    db.execute("UPDATE crm_leads SET stage='auto', trashed_at=0, purged_at=0, summary=NULL WHERE user_id=?", (uid,))
+    db.execute("INSERT INTO crm_messages(user_id, direction, text, ts) VALUES(?,?,?,?)",
+               (uid, "sys", "🔄 Воронка сброшена на нулевой шаг", int(time.time())))
+    db.commit()
+    crm_forget_state(uid)
+    if start:
+        await fx_begin(uid)
+
+
+async def crm_erase_lead(uid: int):
+    """Полностью удаляет человека из базы и из воронки. Платежи (история денег) остаются.
+    Возвращает текст ошибки или None. Если он напишет снова, начнёт с нулевого шага."""
+    u = db.execute("SELECT blocked FROM users WHERE user_id=?", (uid,)).fetchone()
+    if u and u["blocked"]:
+        return "Он заблокирован: удаление сняло бы блокировку. Сначала разблокируйте (/unblock), потом удаляйте."
+    sub = db.execute("SELECT expires_at, active, method_id FROM users WHERE user_id=?", (uid,)).fetchone()
+    if sub and (sub["active"] or sub["method_id"]):
+        until = f" до {fmt(datetime.fromisoformat(sub['expires_at']))}" if sub["expires_at"] else ""
+        return (f"У него есть действующая подписка{until} или сохранённая карта: удаление сотрёт запись о подписке и "
+                "автоплатёж. Сначала завершите подписку.")
+    t = db.execute("SELECT chat_id, thread_id FROM crm_topics WHERE user_id=?", (uid,)).fetchone()
+    if t:
+        try:
+            await bot.delete_forum_topic(chat_id=t["chat_id"], message_thread_id=t["thread_id"])
+        except Exception:
+            logging.warning("не удалось удалить тему CRM лида %s", uid)
+    for q in ("DELETE FROM crm_messages WHERE user_id=?", "DELETE FROM crm_notes WHERE user_id=?",
+              "DELETE FROM crm_seen WHERE user_id=?", "DELETE FROM crm_topics WHERE user_id=?",
+              "DELETE FROM crm_out WHERE user_id=?", "DELETE FROM crm_leads WHERE user_id=?",
+              "DELETE FROM crm_profiles WHERE user_id=?", "DELETE FROM funnel_users WHERE user_id=?",
+              "DELETE FROM support_links WHERE user_id=?", "DELETE FROM help WHERE user_id=?",
+              "DELETE FROM users WHERE user_id=?"):
+        db.execute(q, (uid,))
+    db.commit()
+    crm_forget_state(uid)
+    return None
+
+
+async def check_series():
+    """Серия уроков: после теста бот сам присылает письма по расписанию FUNNEL_SERIES."""
+    if not FUNNEL_SERIES:
+        return
+    t = int(time.time())
+    for f in db.execute("SELECT user_id, done_at, series_idx FROM funnel_users "
+                        "WHERE done=1 AND done_at>0 AND series_idx<?", (len(FUNNEL_SERIES),)).fetchall():
+        uid, idx = f["user_id"], f["series_idx"]
+        days, text = FUNNEL_SERIES[idx]
+        if t < f["done_at"] + days * 86400:
+            continue
+        blocked = db.execute("SELECT blocked FROM users WHERE user_id=?", (uid,)).fetchone()
+        if active_subscription(uid) or (blocked and blocked["blocked"]):  # купил или заблокирован: серию заканчиваем
+            db.execute("UPDATE funnel_users SET series_idx=? WHERE user_id=?", (len(FUNNEL_SERIES), uid))
+            db.commit()
+            continue
+        db.execute("UPDATE funnel_users SET series_idx=series_idx+1 WHERE user_id=?", (uid,))
+        db.commit()
+        await safe_send(uid, text)
+        db.execute("INSERT INTO crm_messages(user_id, direction, text, ts) VALUES(?,?,?,?)",
+                   (uid, "out", f"[урок серии {idx + 1}] " + text, int(time.time())))
+        db.commit()
+        await crm_notify(uid, f"📚 Отправлен урок серии {idx + 1} из {len(FUNNEL_SERIES)}.")
+
+
 async def scheduler():
     while True:
         try:
@@ -1522,11 +3347,380 @@ async def scheduler():
                 await check_pending()
                 await check_pending_methods()
             await check_stuck()
+            await check_funnel()
+            await check_series()
+            await check_cleanup()
             await check_backup()
             await check_subscriptions()
         except Exception:
             logging.exception("ошибка фоновой проверки")
         await asyncio.sleep(60)
+
+
+# ====================== МИНИ-АПП CRM (веб-часть) ======================
+# Страница miniapp.html лежит рядом с bot.py. Доступ только у ADMIN_ID: каждый запрос
+# проверяется по подписи Telegram (initData), подделать её без токена бота нельзя.
+MINIAPP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp.html")
+
+
+def crm_auth(init_data: str) -> bool:
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        got = pairs.pop("hash", "")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not got or not hmac.compare_digest(calc, got):
+            return False
+        if time.time() - int(pairs.get("auth_date", "0")) > 86400:
+            return False
+        return int(json.loads(pairs["user"])["id"]) == ADMIN_ID
+    except Exception:
+        return False
+
+
+def crm_api(fn):
+    async def wrapper(request: web.Request):
+        if not crm_auth(request.headers.get("X-Init-Data", "")):
+            return web.json_response({"error": "auth"}, status=401)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        try:
+            return web.json_response(await fn(data))
+        except Exception:
+            logging.exception("ошибка API мини-аппа")
+            return web.json_response({"error": "server"}, status=500)
+    return wrapper
+
+
+def _ts(s) -> int | None:
+    try:
+        return int(datetime.fromisoformat(s).replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        return None
+
+
+def crm_is_active(u) -> bool:
+    return bool(u and u["active"] and u["expires_at"] and datetime.fromisoformat(u["expires_at"]) > now())
+
+
+def crm_seg(f):
+    return funnel_segment(funnel_answers(f)) if f and f["done"] else None
+
+
+def crm_auto_stage(active: bool, f) -> str:
+    """Стадия по фактам: вход -> серия уроков (вместе с тестом) -> готов к закрытию -> купил."""
+    if active:
+        return "won"
+    if not f or f["stage"] in ("group", "pick"):
+        return "entered"
+    if not f["done"]:
+        return "series"
+    if f["done_at"] and f["series_idx"] < len(FUNNEL_SERIES):
+        return "series"
+    return "ready"
+
+
+def crm_build(uid, u, f, name, lead, last, unread) -> dict:
+    active = crm_is_active(u)
+    seg = crm_seg(f)
+    username = u["username"] if u else None
+    auto = crm_auto_stage(active, f)
+    manual = lead["stage"] if lead and lead["stage"] in CRM_STAGES else None
+    stage = "won" if active else (manual or auto)
+    exp_ts = _ts(u["expires_at"]) if u and u["expires_at"] else None
+    days_left = math.ceil((exp_ts - time.time()) / 86400) if (active and exp_ts) else None
+    joined = _ts(u["joined_at"]) if u and u["joined_at"] else (f["created"] if f else None)
+    trashed = lead["trashed_at"] if lead and stage == "lost" and lead["trashed_at"] else 0
+    trash_left = max(0, math.ceil((trashed + CRM_TRASH_DAYS * 86400 - time.time()) / 86400)) if trashed else None
+    return {
+        "trash_left": trash_left, "purged": bool(lead and lead["purged_at"]),
+        "summary": lead["summary"] if lead and lead["summary"] else None,
+        "id": uid, "name": name or (f"@{username}" if username else str(uid)), "username": username,
+        "seg": seg, "active": active, "expires": fmt(datetime.fromisoformat(u["expires_at"])) if exp_ts else None,
+        "days_left": days_left, "stage": stage, "override": bool(manual and not active), "auto_stage": auto, "amount": lead["amount"] if lead and lead["amount"] else None,
+        "blocked": bool(u and u["blocked"]), "joined": joined,
+        "source": f["source"] if f else None,
+        "src": funnel_source_id(f["source"]) if f else None,
+        "src_detail": funnel_source_detail(f["source"]) if f else None,
+        "funnel": ("done" if f and f["done"] else (f["stage"] if f else None)),
+        "last": ({"dir": last["direction"], "text": last["text"], "ts": last["ts"]} if last else None),
+        "unread": unread,
+    }
+
+
+async def crm_fill_names(ids):
+    """Имён в базе нет, поэтому берём их у Telegram и кэшируем (не больше 15 за раз)."""
+    have = {r["user_id"] for r in db.execute("SELECT user_id FROM crm_profiles")}
+    missing = [i for i in ids if i not in have][:15]
+    if not missing:
+        return
+
+    async def one(i):
+        try:
+            chat = await asyncio.wait_for(bot.get_chat(i), 5)
+            name = chat.full_name or ""
+        except Exception:
+            name = ""  # не получилось: запомним пустое, чтобы не дёргать Telegram каждый раз
+        db.execute("INSERT OR IGNORE INTO crm_profiles(user_id, name) VALUES(?,?)", (i, name))
+
+    await asyncio.gather(*(one(i) for i in missing))
+    db.commit()
+
+
+def crm_copy_text(lead: dict, prof: dict) -> str:
+    """Только вопросы, на которые отвечал человек, и его ответы: без имени, источника и оценок."""
+    lines = []
+    for x in prof.get("copy_qa") or prof["qa"]:
+        lines += [f"Вопрос: {x['q']}", f"Ответ: {x['a']}", ""]
+    return "\n".join(lines).strip()
+
+
+def crm_profile(f):
+    if not f:
+        return None
+    a = funnel_answers(f)
+    if a.get("flow") == "v2":  # новая воронка: урок, 5 открытых вопросов, обратная связь
+        qa = [{"q": "Бесплатный урок", "a": a.get("lesson") or "—"}]
+        qa += [{"q": t, "a": a.get(f"q{i + 1}") or "—"} for i, t in enumerate(FX_Q_SHORT)]
+        qa.append({"q": "Получил ценность в приложении", "a": {"yes": "Да", "no": "Нет"}.get(a.get("fb_value"), "—")})
+        if a.get("fb_reason"):
+            qa.append({"q": "Почему нет", "a": a["fb_reason"]})
+        if a.get("fb_text"):
+            qa.append({"q": "Что особенно понравилось", "a": a["fb_text"]})
+        prof = {"qa": qa, "done": bool(f["done"]), "source": funnel_source_label(f["source"]),
+                "stage": FUNNEL_STAGE_NAMES.get(f["stage"], f["stage"])}
+        cq = [{"q": t[0], "a": a[f"q{i + 1}"]} for i, t in enumerate(FX_QUESTIONS) if a.get(f"q{i + 1}")]
+        if a.get("fb_reason"):
+            cq.append({"q": "Почему вы не получили ценность?", "a": a["fb_reason"]})
+        if a.get("fb_text"):
+            cq.append({"q": "Что вам особенно понравилось?", "a": a["fb_text"]})
+        prof["copy_qa"] = cq
+        if f["done"]:
+            prof.update(segment="🟢 Готов к работе", product="индивидуальное предложение, подарок и подписка «Круг»")
+        return prof
+    qa = [{"q": "Аудитория", "a": a.get("group") or "—"}]
+    for q in FUNNEL_TEST:
+        v = a.get(q["key"])
+        if isinstance(v, list):
+            v = "; ".join(v)
+        qa.append({"q": q["title"], "a": v or "—"})
+    prof = {"qa": qa, "done": bool(f["done"]), "source": funnel_source_label(f["source"]),
+            "stage": FUNNEL_STAGE_NAMES.get(f["stage"], f["stage"])}
+    if f["done"]:
+        seg = funnel_segment(a)
+        i = a.get("q1_i")
+        prof.update(
+            resume=funnel_resume(a, seg), problems=funnel_extra_problems(a),
+            direction=FUNNEL_DIRECTIONS[i] if isinstance(i, int) and 0 <= i < len(FUNNEL_DIRECTIONS)
+            else FUNNEL_DIRECTIONS[-1],
+            product=FUNNEL_SEGMENTS[seg][2], segment=FUNNEL_SEGMENTS[seg][0])
+    return prof
+
+
+async def api_leads(data):
+    ids = [r[0] for r in db.execute(
+        "SELECT user_id FROM users WHERE user_id!=? UNION SELECT user_id FROM funnel_users WHERE user_id!=?",
+        (ADMIN_ID, ADMIN_ID))]
+    await crm_fill_names(ids)
+    users = {r["user_id"]: r for r in db.execute("SELECT * FROM users")}
+    funnel = {r["user_id"]: r for r in db.execute("SELECT * FROM funnel_users")}
+    names = {r["user_id"]: r["name"] for r in db.execute("SELECT * FROM crm_profiles")}
+    leads = {r["user_id"]: r for r in db.execute("SELECT * FROM crm_leads")}
+    last = {r["user_id"]: r for r in db.execute(
+        "SELECT user_id, direction, text, MAX(ts) AS ts FROM crm_messages WHERE direction!='sys' GROUP BY user_id")}
+    unread = {r["user_id"]: r["c"] for r in db.execute(
+        "SELECT m.user_id, COUNT(*) AS c FROM crm_messages m LEFT JOIN crm_seen s ON s.user_id=m.user_id "
+        "WHERE m.direction='in' AND m.ts>COALESCE(s.ts,0) GROUP BY m.user_id")}
+    out = [crm_build(i, users.get(i), funnel.get(i), names.get(i), leads.get(i), last.get(i), unread.get(i, 0))
+           for i in ids]
+
+    t = time.time()
+    day0 = t - t % 86400
+    open_leads = [l for l in out if not l["active"] and not l["blocked"] and l["stage"] in CRM_PROB_STAGE]
+    potential_all = sum(l["amount"] or PRICE for l in open_leads)
+    weighted = 0.0
+    for l in open_leads:
+        weighted += (l["amount"] or PRICE) * CRM_PROB_STAGE[l["stage"]]
+    pay_total = db.execute("SELECT COUNT(*) FROM payments").fetchone()[0]
+    pay_30 = db.execute("SELECT COUNT(*) FROM payments WHERE created>=?",
+                        (iso(now() - timedelta(days=30)),)).fetchone()[0]
+    stats = {
+        "users": len(out), "funnel": sum(1 for l in out if l["funnel"]),
+        "active": sum(1 for l in out if l["active"]),
+        "expiring": sum(1 for l in out if l["active"] and l["days_left"] is not None and l["days_left"] <= 7),
+        "new_today": sum(1 for l in out if l["joined"] and l["joined"] >= day0),
+        "new_week": sum(1 for l in out if l["joined"] and l["joined"] >= t - 7 * 86400),
+        "open": len(open_leads), "potential_all": potential_all, "potential": weighted,
+        "revenue": pay_total * PRICE, "revenue_30": pay_30 * PRICE, "payments": pay_total,
+        "mrr": sum(1 for l in out if l["active"]) * PRICE * 30 / PERIOD_DAYS,
+        "seg": {k: sum(1 for l in out if l["seg"] == k) for k in ("ready", "interested", "cold")},
+        "src": {k: {"leads": sum(1 for l in out if l["src"] == k),
+                    "active": sum(1 for l in out if l["src"] == k and l["active"]),
+                    "ready": sum(1 for l in out if l["src"] == k and l["stage"] == "ready")}
+                for k in FUNNEL_SOURCES},
+        "stages": {k: sum(1 for l in out if l["stage"] == k) for k in CRM_STAGES},
+    }
+    return {"leads": out, "stats": stats, "price": PRICE, "trash_days": CRM_TRASH_DAYS,
+            "sources": [{"id": k, "icon": v[0], "label": v[1]} for k, v in FUNNEL_SOURCES.items()]}
+
+
+async def api_lead(data):
+    uid = int(data["id"])
+    await crm_fill_names([uid])
+    u = db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    f = funnel_get(uid)
+    nm = db.execute("SELECT name FROM crm_profiles WHERE user_id=?", (uid,)).fetchone()
+    lead = db.execute("SELECT * FROM crm_leads WHERE user_id=?", (uid,)).fetchone()
+    last = db.execute("SELECT direction, text, ts FROM crm_messages WHERE user_id=? AND direction!='sys' ORDER BY id DESC LIMIT 1",
+                      (uid,)).fetchone()
+    msgs = [{"id": r["id"], "direction": r["direction"], "text": r["text"], "ts": r["ts"],
+             "deleted": bool(r["deleted"]), "can_del": bool(r["direction"] == "out" and r["tg_id"] and not r["deleted"])}
+            for r in reversed(db.execute(
+                "SELECT id, direction, text, ts, tg_id, deleted FROM crm_messages WHERE user_id=? "
+                "ORDER BY id DESC LIMIT 400", (uid,)).fetchall())]
+    notes = [dict(r) for r in db.execute(
+        "SELECT id, text, ts FROM crm_notes WHERE user_id=? ORDER BY id DESC", (uid,))]
+    db.execute("INSERT OR REPLACE INTO crm_seen(user_id, ts) VALUES(?,?)", (uid, int(time.time())))
+    db.commit()
+    res = {"lead": crm_build(uid, u, f, nm["name"] if nm else None, lead, last, 0), "messages": msgs, "notes": notes}
+    if not data.get("light"):
+        res["profile"] = crm_profile(f)
+        if res["profile"]:
+            res["profile"]["copy"] = crm_copy_text(res["lead"], res["profile"])
+    return res
+
+
+async def api_send(data):
+    uid, text = int(data["id"]), (data.get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "Пустое сообщение"}
+    try:
+        sent = await bot.send_message(uid, html.escape(text))
+    except Exception:
+        logging.exception("мини-апп: не удалось отправить сообщение %s", uid)
+        return {"ok": False, "error": "Не доставлено: пользователь мог заблокировать бота."}
+    db.execute("INSERT INTO crm_messages(user_id, direction, text, ts, tg_id) VALUES(?,?,?,?,?)",
+               (uid, "out", text, int(time.time()), sent.message_id))
+    db.commit()
+    await crm_notify(uid, "📱 Из CRM: " + html.escape(text))  # копия в тему, если CRM в топиках включена
+    return {"ok": True}
+
+
+async def api_pay(data):
+    uid = int(data["id"])
+    sub = active_subscription(uid)
+    if sub:
+        return {"ok": False, "error": f"Подписка уже активна до {fmt(datetime.fromisoformat(sub['expires_at']))}."}
+    try:
+        sent = await show_product(uid, None)
+    except Exception:
+        logging.exception("мини-апп: не удалось отправить форму оплаты %s", uid)
+        return {"ok": False, "error": "Не доставлено: пользователь мог заблокировать бота."}
+    db.execute("INSERT INTO crm_messages(user_id, direction, text, ts, tg_id) VALUES(?,?,?,?,?)",
+               (uid, "out", "[форма оплаты]", int(time.time()), sent.message_id))
+    db.execute("UPDATE users SET pay_started_at=? WHERE user_id=? AND active=0", (iso(now()), uid))
+    db.commit()
+    return {"ok": True}
+
+
+async def api_del(data):
+    """Удалить своё сообщение у человека в Telegram (Telegram разрешает в течение 48 часов)."""
+    uid, mid = int(data["id"]), int(data["msg_id"])
+    r = db.execute("SELECT * FROM crm_messages WHERE id=? AND user_id=? AND direction='out'", (mid, uid)).fetchone()
+    if not r:
+        return {"ok": False, "error": "Сообщение не найдено."}
+    if r["deleted"]:
+        return {"ok": True}
+    if not r["tg_id"]:
+        return {"ok": False, "error": "Это сообщение отправлено до обновления: у него нет номера в Telegram, удалить нельзя."}
+    try:
+        await bot.delete_message(uid, r["tg_id"])
+    except Exception:
+        logging.exception("мини-апп: не удалось удалить сообщение %s у %s", r["tg_id"], uid)
+        return {"ok": False, "error": "Telegram не дал удалить: прошло больше 48 часов или сообщение уже удалено."}
+    db.execute("UPDATE crm_messages SET deleted=1 WHERE id=?", (mid,))
+    db.commit()
+    return {"ok": True}
+
+
+async def api_reset(data):
+    uid = ADMIN_ID if data.get("self") else int(data["id"])
+    await crm_reset_lead(uid, start=(uid == ADMIN_ID))
+    return {"ok": True, "started": uid == ADMIN_ID}
+
+
+async def api_erase(data):
+    uid = ADMIN_ID if data.get("self") else int(data["id"])
+    err = await crm_erase_lead(uid)
+    return {"ok": not err, "error": err}
+
+
+async def api_note(data):
+    uid, text = int(data["id"]), (data.get("text") or "").strip()
+    if text:
+        db.execute("INSERT INTO crm_notes(user_id, text, ts) VALUES(?,?,?)", (uid, text[:4000], int(time.time())))
+        db.commit()
+    return {"ok": True}
+
+
+async def api_note_del(data):
+    db.execute("DELETE FROM crm_notes WHERE id=?", (int(data["note_id"]),))
+    db.commit()
+    return {"ok": True}
+
+
+async def api_stage(data):
+    uid, stage = int(data["id"]), data.get("stage")
+    if stage != "auto" and stage not in CRM_STAGES:
+        return {"ok": False, "error": "Неизвестная стадия"}
+    try:
+        amount = float(data["amount"]) if data.get("amount") not in (None, "") else None
+    except (TypeError, ValueError):
+        amount = None
+    prev = db.execute("SELECT stage, trashed_at FROM crm_leads WHERE user_id=?", (uid,)).fetchone()
+    trashed = 0  # «Не купил / закрыт» = корзина: через CRM_TRASH_DAYS дней данные очистятся
+    if stage == "lost":
+        trashed = prev["trashed_at"] if prev and prev["stage"] == "lost" and prev["trashed_at"] else int(time.time())
+    db.execute("INSERT INTO crm_leads(user_id, stage, amount, updated, trashed_at) VALUES(?,?,?,?,?) "
+               "ON CONFLICT(user_id) DO UPDATE SET stage=excluded.stage, amount=excluded.amount, "
+               "updated=excluded.updated, trashed_at=excluded.trashed_at",
+               (uid, stage, amount, int(time.time()), trashed))
+    db.commit()
+    return {"ok": True}
+
+
+async def api_settings(data):
+    if data.get("set") and CRM_CHAT_ID:
+        crm_topics_set(bool(data.get("topics")))
+    return {"topics_available": bool(CRM_CHAT_ID), "topics_on": crm_topics_on(),
+            "price": PRICE, "period_days": PERIOD_DAYS, "trash_days": CRM_TRASH_DAYS,
+            "buyer_sys_days": CRM_BUYER_SYS_DAYS, "sys_days": CRM_SYS_DAYS, "stale_days": CRM_STALE_DAYS}
+
+
+async def crm_index(request: web.Request):
+    try:
+        with open(MINIAPP_FILE, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError:
+        return web.Response(status=404, text="miniapp.html не найден рядом с bot.py")
+    return web.Response(text=body, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+async def crm_health(request: web.Request):
+    return web.Response(text="ok")
+
+
+def crm_web_routes(app: web.Application):
+    app.router.add_get("/", crm_index)
+    app.router.add_get("/app", crm_index)
+    app.router.add_get("/health", crm_health)
+    for name, fn in (("leads", api_leads), ("lead", api_lead), ("send", api_send), ("pay", api_pay), ("del", api_del), ("reset", api_reset), ("erase", api_erase),
+                     ("note", api_note), ("note_del", api_note_del), ("stage", api_stage),
+                     ("settings", api_settings)):
+        app.router.add_post(f"/api/{name}", crm_api(fn))
 
 
 # ---------- Вебхук ЮKassa (необязателен) ----------
@@ -1556,12 +3750,15 @@ async def main():
         BotCommand(command="status", description="Статус подписки"),
         BotCommand(command="help", description="Связаться с нами"),
         BotCommand(command="cancel", description="Отключить автопродление"),
+        BotCommand(command="unsubscribe", description="Отказаться от рекламной рассылки"),
     ])
     await bot.set_my_commands([
         BotCommand(command="start", description="Начать / оформить подписку"),
         BotCommand(command="status", description="Статус подписки"),
         BotCommand(command="help", description="Связаться с нами"),
         BotCommand(command="cancel", description="Отключить автопродление"),
+        BotCommand(command="unsubscribe", description="Отказаться от рекламной рассылки"),
+        BotCommand(command="chek", description="Отправить чек (фото с подписью /chek id)"),
         BotCommand(command="users", description="Управление пользователями"),
         BotCommand(command="menu", description="Админ-панель"),
         BotCommand(command="grant", description="Выдать подписку"),
@@ -1572,13 +3769,28 @@ async def main():
         BotCommand(command="all_sub", description="Сообщение активным подписчикам"),
         BotCommand(command="block", description="Заблокировать пользователя"),
         BotCommand(command="unblock", description="Снять блокировку пользователя"),
+        BotCommand(command="app", description="CRM-мини-апп"),
+        BotCommand(command="links", description="Ссылки на воронку по источникам"),
+        BotCommand(command="videos", description="Какие видео воронки заданы"),
+        BotCommand(command="reset", description="Сбросить воронку (себе, id или @ник)"),
+        BotCommand(command="erase", description="Удалить человека из базы (себя, id или @ник)"),
+        BotCommand(command="crm_topics", description="Вкл/выкл CRM в топиках"),
     ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
-    if WEBHOOK_PORT:
+    if MINIAPP_ENABLED and MINIAPP_URL.startswith("https://"):
+        try:
+            await bot.set_chat_menu_button(chat_id=ADMIN_ID, menu_button=MenuButtonWebApp(
+                text="CRM", web_app=WebAppInfo(url=MINIAPP_URL + "/app")))
+        except Exception:
+            logging.exception("не удалось поставить кнопку CRM в меню бота")
+    if WEB_PORT:
         app = web.Application()
         app.router.add_post("/yookassa", yk_hook)
+        if MINIAPP_ENABLED:
+            crm_web_routes(app)
         runner = web.AppRunner(app)
         await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
+        await web.TCPSite(runner, "0.0.0.0", WEB_PORT).start()
+        logging.info("Веб-сервер запущен на порту %s", WEB_PORT)
     asyncio.create_task(scheduler())
     await dp.start_polling(bot)
 
