@@ -82,21 +82,25 @@ FUNNEL_SOURCES = {FUNNEL_PREFIX: ("📸", "Instagram"), "yt": ("▶️", "YouTub
 # Разметка: <b>жирный</b>, <i>курсив</i>. Подстановки в {фигурных скобках} не трогайте.
 T_WELCOME = ("Привет, я бот Круга Ильи Хабирова. Я выдаю доступ к закрытому каналу с лекциями.\n"
              "Оплатить можно картой.\n\nЧтобы оплатить, нажмите на кнопку 👇")
-T_PRODUCT = ("<b>Оплатите доступ в Круг</b>\n"
+T_PRODUCT = ("<b>Ежемесячная подписка</b>\n"
              "Доступ к регулярно пополняемой платформе с лекциями по самопознанию.\n\n"
              "Цена: <b>{price} ₽</b> в месяц\n\n"
              "Перед оплатой ознакомьтесь с {offer}.")
 T_MENU = "Что вы хотите сделать?"
 T_CONSENT = (
     "<b>Добро пожаловать в круг</b>\n\n"
-    "Чтобы запустить бота, нажмите на кнопку «Соглашаюсь».\n\n"
-    "Нажимая на кнопку, вы даёте <a href=\"{consent}\">согласие на обработку персональных данных</a> "
+    "Чтобы запустить бота, выберите один из вариантов ниже.\n\n"
+    "<b>«Соглашаюсь»</b>: вы даёте <a href=\"{consent}\">согласие на обработку персональных данных</a> "
     "в соответствии с <a href=\"{privacy}\">политикой обработки персональных данных</a>, "
     "а также даёте согласие на получение информационных уведомлений и "
     "<a href=\"{ads}\">рекламной рассылки</a>.\n\n"
-    "Просто нажмите кнопку «Соглашаюсь», чтобы продолжить."
+    "<b>«Соглашаюсь без рассылки»</b>: вы даёте <a href=\"{consent}\">согласие на обработку персональных данных</a> "
+    "в соответствии с <a href=\"{privacy}\">политикой обработки персональных данных</a>, "
+    "но отказываетесь от <a href=\"{ads}\">рекламной рассылки</a>. "
+    "Служебные уведомления (доступ, оплата, напоминания о подписке) вы будете получать в любом случае."
 )
 T_CONSENT_BTN = "Соглашаюсь"
+T_CONSENT_BTN_NOADS = "Соглашаюсь без рассылки"
 T_WHAT_YOU_GET = (
     "Приобретая подписку в «Круге», вы получаете доступ к ежемесячно обновляемому "
     "Telegram-каналу с лекциями и статьями о духовном и личностном развитии. "
@@ -194,6 +198,8 @@ def migrate():
             db.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
     if "consent_at" not in cols:  # когда человек нажал «Соглашаюсь»
         db.execute("ALTER TABLE users ADD COLUMN consent_at TEXT")
+    if "ads_optout" not in cols:  # 1 = согласился на обработку данных, но отказался от рекламной рассылки
+        db.execute("ALTER TABLE users ADD COLUMN ads_optout INTEGER DEFAULT 0")
     if "start_payload" not in cols:  # параметр ссылки, с которой человек пришёл (пока не согласился)
         db.execute("ALTER TABLE users ADD COLUMN start_payload TEXT")
     if "method_mode" not in cols:
@@ -722,7 +728,7 @@ async def send_consent(uid: int, username: str | None, payload: str = ""):
     db.execute("UPDATE users SET start_payload=? WHERE user_id=?", (payload or "", uid))
     db.commit()
     text = T_CONSENT.format(consent=CONSENT_URL, privacy=PRIVACY_URL, ads=ADS_URL)
-    kb = markup([btn(T_CONSENT_BTN, "agree")])
+    kb = markup([btn(T_CONSENT_BTN, "agree")], [btn(T_CONSENT_BTN_NOADS, "agree_noads")])
     if os.path.isfile(WELCOME_IMAGE_PATH):
         await bot.send_photo(uid, FSInputFile(WELCOME_IMAGE_PATH), caption=text, reply_markup=kb)
     else:
@@ -761,18 +767,20 @@ async def start(m: Message, command: CommandObject):
     await continue_start(m.from_user, payload)
 
 
-@dp.callback_query(F.data == "agree")
+@dp.callback_query(F.data.in_({"agree", "agree_noads"}))
 async def agree(cb: CallbackQuery):
+    noads = cb.data == "agree_noads"
     uid = cb.from_user.id
     ensure_user(uid, cb.from_user.username)
     row = db.execute("SELECT consent_at, start_payload FROM users WHERE user_id=?", (uid,)).fetchone()
     payload = (row["start_payload"] or "") if row else ""
     first_time = not (row and row["consent_at"])
     if first_time:
-        db.execute("UPDATE users SET consent_at=? WHERE user_id=?", (iso(now()), uid))
+        db.execute("UPDATE users SET consent_at=?, ads_optout=? WHERE user_id=?", (iso(now()), int(noads), uid))
         db.commit()
         try:
-            crm_sys(uid, "✅ Согласился на обработку персональных данных и рассылку")
+            crm_sys(uid, "✅ Согласился на обработку персональных данных, от рекламной рассылки отказался" if noads
+                    else "✅ Согласился на обработку персональных данных и рассылку")
         except Exception:
             logging.exception("не удалось записать согласие в CRM")
     await cb.answer()
@@ -1687,6 +1695,49 @@ async def crm_notify(uid: int, text: str):
         logging.warning("не удалось написать в CRM-тему %s", uid)
 
 
+T_RECEIPT = "Благодарим вас за покупку, вот ваш чек об оплате."
+CHEK_RE = r"^/chek(@\w+)?(\s|$)"
+
+
+@dp.message(F.from_user.id == ADMIN_ID, F.content_type.in_({"photo", "document"}), F.caption.regexp(CHEK_RE))
+async def cmd_chek(m: Message):
+    """Фото чека с подписью /chek 123456 (или /chek @ник) уходит этому человеку.
+    В теме лида в CRM-группе достаточно подписи /chek: чек уйдёт хозяину темы."""
+    parts = (m.caption or "").split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    uid = None
+    if arg:
+        uid = crm_resolve_user(arg)
+    elif CRM_CHAT_ID and m.chat.id == CRM_CHAT_ID and m.message_thread_id:
+        r = db.execute("SELECT user_id FROM crm_topics WHERE chat_id=? AND thread_id=?",
+                       (m.chat.id, m.message_thread_id)).fetchone()
+        uid = r["user_id"] if r else None
+    if uid is None:
+        await m.reply("Не нашёл, кому отправить. Подпишите фото так: /chek 123456 или /chek @ник, "
+                      "либо отправьте его в теме нужного человека.")
+        return
+    try:
+        if m.photo:
+            sent = await bot.send_photo(uid, m.photo[-1].file_id, caption=T_RECEIPT)
+        else:
+            sent = await bot.send_document(uid, m.document.file_id, caption=T_RECEIPT)
+    except Exception:
+        logging.exception("не удалось отправить чек пользователю %s", uid)
+        await m.reply("⚠️ Не удалось отправить: пользователь мог заблокировать бота.")
+        return
+    crm_out_save(m.chat.id, m.message_id, uid, sent.message_id)
+    db.execute("INSERT INTO crm_messages(user_id, direction, text, ts) VALUES(?,?,?,?)",
+               (uid, "out", "[чек об оплате]", int(time.time())))
+    db.commit()
+    await m.reply(f"✅ Чек отправлен: {html.escape(crm_display_name(uid))}")
+
+
+@dp.message(Command("chek"), F.from_user.id == ADMIN_ID)
+async def cmd_chek_help(m: Message):
+    await m.answer("Отправьте фото чека с подписью /chek 123456 (id) или /chek @ник. "
+                   "В теме лида в CRM-группе достаточно подписи /chek.")
+
+
 CRM_RELAY_TYPES = {"text", "photo", "video", "voice", "video_note", "audio", "document", "sticker", "animation"}
 
 
@@ -2358,6 +2409,23 @@ async def status_btn(cb: CallbackQuery):
     await cb.answer()
 
 
+@dp.message(Command("unsubscribe"))
+async def unsubscribe(m: Message):
+    """Отказ от рекламной рассылки в любой момент. Служебные сообщения (доступ, оплата) продолжают приходить."""
+    uid = m.from_user.id
+    ensure_user(uid, m.from_user.username)
+    row = db.execute("SELECT ads_optout FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not (row and row["ads_optout"]):
+        db.execute("UPDATE users SET ads_optout=1 WHERE user_id=?", (uid,))
+        db.commit()
+        try:
+            crm_sys(uid, "🔕 Отказался от рекламной рассылки (/unsubscribe)")
+        except Exception:
+            logging.exception("не удалось записать отписку в CRM")
+    await m.answer("Вы отказались от рекламной рассылки. Служебные уведомления (доступ, оплата, "
+                   "напоминания о подписке) будут приходить по-прежнему.")
+
+
 def admin_menu():
     total = db.execute("SELECT COUNT(*) FROM users WHERE user_id!=?", (ADMIN_ID,)).fetchone()[0]
     active = db.execute(
@@ -2823,7 +2891,7 @@ async def broadcast(m: Message, active_only: bool):
         await m.answer(f"Формат: {command} текст сообщения")
         return
     body = html.escape(parts[1].strip())
-    query = "SELECT user_id FROM users WHERE blocked=0 AND user_id!=?"
+    query = "SELECT user_id FROM users WHERE blocked=0 AND COALESCE(ads_optout,0)=0 AND user_id!=?"
     params: tuple = (ADMIN_ID,)
     if active_only:
         query += " AND active=1 AND expires_at>?"
@@ -2998,7 +3066,7 @@ async def check_pending_methods():
 async def check_stuck():
     """Дошёл до оплаты, но через STUCK_HOURS так и не оплатил: один раз напоминаем."""
     limit = iso(now() - timedelta(hours=STUCK_HOURS))
-    for u in db.execute("SELECT user_id FROM users WHERE active=0 AND stuck_reminded=0 "
+    for u in db.execute("SELECT user_id FROM users WHERE active=0 AND stuck_reminded=0 AND COALESCE(ads_optout,0)=0 "
                         "AND pay_started_at IS NOT NULL AND pay_started_at<=?", (limit,)).fetchall():
         db.execute("UPDATE users SET stuck_reminded=1 WHERE user_id=?", (u["user_id"],))
         db.commit()
@@ -3682,12 +3750,15 @@ async def main():
         BotCommand(command="status", description="Статус подписки"),
         BotCommand(command="help", description="Связаться с нами"),
         BotCommand(command="cancel", description="Отключить автопродление"),
+        BotCommand(command="unsubscribe", description="Отказаться от рекламной рассылки"),
     ])
     await bot.set_my_commands([
         BotCommand(command="start", description="Начать / оформить подписку"),
         BotCommand(command="status", description="Статус подписки"),
         BotCommand(command="help", description="Связаться с нами"),
         BotCommand(command="cancel", description="Отключить автопродление"),
+        BotCommand(command="unsubscribe", description="Отказаться от рекламной рассылки"),
+        BotCommand(command="chek", description="Отправить чек (фото с подписью /chek id)"),
         BotCommand(command="users", description="Управление пользователями"),
         BotCommand(command="menu", description="Админ-панель"),
         BotCommand(command="grant", description="Выдать подписку"),
