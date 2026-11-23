@@ -44,7 +44,7 @@ PRICE = float(os.getenv("PRICE", "2500"))         # цена за период, 
 PERIOD_DAYS = float(os.getenv("PERIOD_DAYS", "30"))
 REMIND_DAYS = float(os.getenv("REMIND_DAYS", "3"))    # за сколько дней напоминать о продлении
 STUCK_HOURS = float(os.getenv("STUCK_HOURS", "24"))   # через сколько часов напомнить «застрявшему» на оплате
-DOCS_URL = "http://docs.habirovcyrcle.online"
+DOCS_URL = "http://habirovcyrcle.ru"
 OFFER_URL = os.getenv("OFFER_URL") or f"{DOCS_URL}/offer/"  # ссылка на публичную оферту (показывается перед оплатой)
 CONSENT_URL = f"{DOCS_URL}/consent/"   # согласие на обработку персональных данных
 PRIVACY_URL = f"{DOCS_URL}/privacy/"   # политика обработки персональных данных
@@ -97,7 +97,7 @@ T_CONSENT = (
     "<b>«Соглашаюсь без рассылки»</b>: вы даёте <a href=\"{consent}\">согласие на обработку персональных данных</a> "
     "в соответствии с <a href=\"{privacy}\">политикой обработки персональных данных</a>, "
     "но отказываетесь от <a href=\"{ads}\">рекламной рассылки</a>. "
-    "Служебные уведомления (доступ, оплата, напоминания о подписке) вы будете получать в любом случае."
+    "Служебные уведомления (доступ, оплата, напоминания о подписке) вы сможете получать в любом случае."
 )
 T_CONSENT_BTN = "Соглашаюсь"
 T_CONSENT_BTN_NOADS = "Соглашаюсь без рассылки"
